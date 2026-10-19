@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=BitChat
+GenericName=Bluetooth Mesh Chat
+Comment=Off-grid chat with nearby BitChat users over Bluetooth
+Exec=bitchat-desktop
+Icon=bitchat-desktop
+Terminal=false
+Categories=Network;Chat;InstantMessaging;GTK;
+Keywords=bitchat;bluetooth;mesh;chat;offline;
+StartupNotify=true
+StartupWMClass=com.dyl.BitchatDesktop
+X-GNOME-UsesNotifications=true
