@@ -128,6 +128,8 @@ CSS = """
 .status-dot.on { background-color: @success_color; }
 .status-dot.wait { background-color: @warning_color; }
 .status-dot.off { background-color: alpha(currentColor, 0.3); }
+.offline-fav { opacity: 0.55; }
+.fav-star.on { color: #e5a50a; }
 .status-dot.err { background-color: @error_color; }
 .unread { background-color: @accent_bg_color; color: @accent_fg_color; border-radius: 9px;
           padding: 0 6px; font-size: 0.8em; font-weight: bold; min-width: 10px; }
@@ -301,6 +303,11 @@ class BitchatWindow(Adw.ApplicationWindow):
                                     visible=False)
         self.leave_btn.connect("clicked", lambda *_: self.leave_current())
         ch.pack_end(self.leave_btn)
+        self.fav_btn = Gtk.Button(icon_name="non-starred-symbolic", tooltip_text="Add to favourites",
+                                  visible=False, css_classes=["flat", "fav-star"])
+        self.fav_btn.connect("clicked", lambda *_: self.current and self.current.startswith("dm:")
+                             and self.toggle_favorite(self.current[3:]))
+        ch.pack_end(self.fav_btn)
         self.content_view.add_top_bar(ch)
         self.banner = Banner(title="", revealed=False)
         self.content_view.add_top_bar(self.banner)
@@ -344,7 +351,7 @@ class BitchatWindow(Adw.ApplicationWindow):
             bp.add_setter(self.split, "collapsed", True)
             self.add_breakpoint(bp)
 
-    def _add_sidebar_row(self, listbox, key, title, subtitle, icon=None, dot=None):
+    def _add_sidebar_row(self, listbox, key, title, subtitle, icon=None, dot=None, star=None):
         row = Adw.ActionRow(title=GLib.markup_escape_text(title), activatable=True)
         if subtitle:
             row.set_subtitle(GLib.markup_escape_text(subtitle))
@@ -357,9 +364,41 @@ class BitchatWindow(Adw.ApplicationWindow):
             row.add_prefix(Gtk.Image(icon_name=icon))
         unread = Gtk.Label(css_classes=["unread"], valign=Gtk.Align.CENTER, visible=False)
         row.add_suffix(unread)
+        if star is not None:
+            pid, on = star
+            row.add_suffix(self._star_button(pid, on))
         listbox.append(row)
         self.sidebar_rows[key] = (row, unread, dotw)
         return row
+
+    # ---------- favourites ----------
+    def _star_button(self, pid, on):
+        b = Gtk.Button(icon_name="starred-symbolic" if on else "non-starred-symbolic",
+                       css_classes=["flat", "circular", "fav-star"] + (["on"] if on else []),
+                       valign=Gtk.Align.CENTER,
+                       tooltip_text="Remove from favourites" if on else "Add to favourites")
+        b.connect("clicked", lambda *_: self.toggle_favorite(pid))
+        return b
+
+    def toggle_favorite(self, pid):
+        p = self.peers.get(pid, {})
+        on = not p.get("favorite", False)
+        self.send_cmd({"cmd": "favorite", "peer_id": pid, "fingerprint": p.get("fingerprint", ""), "on": on})
+
+    def _update_fav_header(self):
+        key = self.current or ""
+        if not key.startswith("dm:"):
+            self.fav_btn.set_visible(False)
+            return
+        p = self.peers.get(key[3:])
+        self.fav_btn.set_visible(bool(p and p.get("fingerprint")))
+        on = bool(p and p.get("favorite"))
+        self.fav_btn.set_icon_name("starred-symbolic" if on else "non-starred-symbolic")
+        self.fav_btn.set_tooltip_text("Remove from favourites" if on else "Add to favourites")
+        if on:
+            self.fav_btn.add_css_class("on")
+        else:
+            self.fav_btn.remove_css_class("on")
 
     def _row_activated(self, listbox, row):
         key = getattr(row, "key", None)
@@ -395,8 +434,9 @@ class BitchatWindow(Adw.ApplicationWindow):
         self.conv_title.set_title(c.title)
         self.content_page.set_title(c.title)
         self.leave_btn.set_visible(c.kind == "channel")
+        self._update_fav_header()
         if c.kind == "public":
-            n = len(self.peers)
+            n = sum(1 for p in self.peers.values() if not p.get("offline"))
             self.conv_title.set_subtitle(f"Bluetooth mesh · {n} {'person' if n == 1 else 'people'} nearby")
             self.entry.set_placeholder_text("Message everyone nearby…")
         elif c.kind == "channel":
@@ -420,7 +460,15 @@ class BitchatWindow(Adw.ApplicationWindow):
     def _dm_subtitle(self, p):
         if not p:
             return "Not in range"
+        if p.get("offline"):
+            return "★ Favourite · not in range"
         bits = ["Online" if p.get("online") else "Away"]
+        if p.get("favorite") and p.get("favorited_us"):
+            bits.insert(0, "★ Mutual favourite")
+        elif p.get("favorite"):
+            bits.insert(0, "★ Favourite")
+        elif p.get("favorited_us"):
+            bits.insert(0, "Favourited you")
         bits.append("🔒 Encrypted session up" if p.get("encrypted") else "Encrypts on first message")
         return " · ".join(bits)
 
@@ -672,6 +720,22 @@ class BitchatWindow(Adw.ApplicationWindow):
             self._update_me()
             if not self.visible:
                 self.toast(ev.get("text", ""))
+        elif kind == "favorite":
+            pid = ev.get("peer_id", "")
+            if pid in self.peers:
+                self.peers[pid]["favorite"] = bool(ev.get("on"))
+            self._update_fav_header()
+            if not ev.get("saved", True):
+                self.toast("Couldn't save favourites")
+        elif kind == "favorite_update":
+            # Android shows this inside the private chat too
+            key = f"dm:{ev.get('peer_id')}"
+            nick = ev.get("nickname", "")
+            fav = ev.get("favorited_us")
+            mine = self.peers.get(ev.get("peer_id"), {}).get("favorite")
+            if key in self.convs:
+                extra = (" — mutual!" if mine else " — star them back to make it mutual") if fav else ""
+                self.add_system(key, f"{nick} {'favourited' if fav else 'unfavourited'} you{extra}")
         elif kind == "notice":
             self.toast(ev.get("text", ""))
         elif kind == "error":
@@ -715,12 +779,25 @@ class BitchatWindow(Adw.ApplicationWindow):
                 self.people_list.remove(row)
         shown = set()
         online = 0
-        for pid, p in sorted(self.peers.items(), key=lambda kv: (not kv[1].get("online"), kv[1]["nickname"].lower())):
+        def order(kv):
+            p = kv[1]
+            return (not p.get("favorite"), not p.get("online"), p["nickname"].lower())
+        for pid, p in sorted(self.peers.items(), key=order):
             key = f"dm:{pid}"
-            sub = ("Online" if p.get("online") else "Away") + (" · 🔒" if p.get("encrypted") else "")
+            if p.get("offline"):
+                sub = "Not in range"
+            else:
+                sub = ("Online" if p.get("online") else "Away") + (" · 🔒" if p.get("encrypted") else "")
+            if p.get("favorite") and p.get("favorited_us"):
+                sub = "Mutual · " + sub
+            elif p.get("favorited_us"):
+                sub = "Favourited you · " + sub
             online += 1 if p.get("online") else 0
-            self._add_sidebar_row(self.people_list, key, p["nickname"], sub,
-                                  dot="on" if p.get("online") else "off")
+            row = self._add_sidebar_row(self.people_list, key, p["nickname"], sub,
+                                        dot="on" if p.get("online") else "off",
+                                        star=(pid, bool(p.get("favorite"))) if p.get("fingerprint") else None)
+            if p.get("offline"):
+                row.add_css_class("offline-fav")
             shown.add(key)
             if key in self.convs:
                 self.convs[key].title = p["nickname"]
@@ -730,7 +807,9 @@ class BitchatWindow(Adw.ApplicationWindow):
             if conv.kind == "dm" and key not in shown:
                 self._add_sidebar_row(self.people_list, key, conv.title, "Out of range", dot="off")
                 self._update_unread(key)
-        self.people_heading.set_label(f"People nearby ({len(self.peers)})" if self.peers else "People nearby")
+        nearby = sum(1 for p in self.peers.values() if not p.get("offline"))
+        self.people_heading.set_label(f"People nearby ({nearby})" if nearby else "People nearby")
+        self._update_fav_header()
         if self.current in self.sidebar_rows:
             row = self.sidebar_rows[self.current][0]
             if row.get_parent() is self.people_list:
@@ -738,7 +817,7 @@ class BitchatWindow(Adw.ApplicationWindow):
         if self.current == PUBLIC or (self.current or "").startswith("dm:"):
             c = self.convs.get(self.current)
             if c and c.kind == "public":
-                n = len(self.peers)
+                n = sum(1 for p in self.peers.values() if not p.get("offline"))
                 self.conv_title.set_subtitle(f"Bluetooth mesh · {n} {'person' if n == 1 else 'people'} nearby")
             elif c:
                 self.conv_title.set_subtitle(self._dm_subtitle(self.peers.get(self.current[3:])))
@@ -969,6 +1048,20 @@ class BitchatApp(Adw.Application):
                 GLib.timeout_add(700, lambda: (self.win.save_screenshot(path), False)[1])
                 return False
             GLib.timeout_add_seconds(int(secs), shot)
+        fav = os.environ.get("BITCHAT_DESKTOP_SELFTEST_FAV")
+        if fav:
+            # "seconds|nick": open that private chat and click the header star
+            secs, _, nick = fav.partition("|")
+
+            def try_fav():
+                pid = next((k for k, p in self.win.peers.items() if p.get("nickname") == nick), None)
+                row = self.win.sidebar_rows.get(f"dm:{pid}", (None,))[0] if pid else None
+                if row is None:
+                    return True
+                self.win._row_activated(self.win.people_list, row)
+                self.win.fav_btn.emit("clicked")
+                return False
+            GLib.timeout_add_seconds(int(secs), try_fav)
         rc = os.environ.get("BITCHAT_DESKTOP_SELFTEST_RECONNECT")
         if rc:
             GLib.timeout_add_seconds(int(rc), lambda: (self.win.restart_backend(), False)[1])
