@@ -15,7 +15,99 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+
+# libadwaita >= 1.4 gets the native adaptive widgets; older releases (Debian
+# Bookworm ships 1.2) get small stand-ins with the same method names.
+MODERN = (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 4) and not os.environ.get("BITCHAT_DESKTOP_FORCE_COMPAT")
+
+
+class ToolbarViewCompat(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self._content = None
+
+    def add_top_bar(self, w):
+        if self._content is not None:
+            self.insert_child_after(w, self._last_bar) if getattr(self, "_last_bar", None) else self.prepend(w)
+        else:
+            self.append(w)
+        self._last_bar = w
+
+    def set_content(self, w):
+        w.set_vexpand(True)
+        self._content = w
+        self.append(w)
+
+
+class PageCompat:
+    def __init__(self, title="", child=None):
+        self.child = child
+
+    def set_title(self, _t):
+        pass
+
+
+class SplitCompat(Gtk.Box):
+    def __init__(self, **_kw):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+
+    def set_sidebar(self, page):
+        page.child.set_size_request(270, -1)
+        self.append(page.child)
+        self.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+    def set_content(self, page):
+        page.child.set_hexpand(True)
+        self.append(page.child)
+
+    def set_show_content(self, _v):
+        pass
+
+
+class BannerCompat(Gtk.Revealer):
+    __gsignals__ = {"button-clicked": (GObject.SignalFlags.RUN_FIRST, None, ())}
+
+    def __init__(self, title="", revealed=False):
+        super().__init__(reveal_child=revealed)
+        box = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
+        self._label = Gtk.Label(label=title, hexpand=True, xalign=0, wrap=True)
+        self._btn = Gtk.Button(label="Reconnect")
+        self._btn.connect("clicked", lambda *_: self.emit("button-clicked"))
+        box.append(self._label)
+        box.append(self._btn)
+        frame = Gtk.Box(css_classes=["banner-compat"])
+        box.set_hexpand(True)
+        frame.append(box)
+        self.set_child(frame)
+
+    def set_title(self, t):
+        self._label.set_label(t)
+
+    def set_button_label(self, t):
+        self._btn.set_label(t)
+
+    def set_revealed(self, v):
+        self.set_reveal_child(v)
+
+
+ToolbarView = Adw.ToolbarView if MODERN else ToolbarViewCompat
+NavigationPage = Adw.NavigationPage if MODERN else PageCompat
+SplitView = Adw.NavigationSplitView if MODERN else SplitCompat
+Banner = Adw.Banner if MODERN else BannerCompat
+
+
+def alert(parent, heading, body):
+    if MODERN:
+        return Adw.AlertDialog(heading=heading, body=body)
+    return Adw.MessageDialog(transient_for=parent, modal=True, heading=heading, body=body)
+
+
+def present_dialog(dlg, parent):
+    if MODERN:
+        dlg.present(parent)
+    else:
+        dlg.present()
 
 APP_ID = "com.dyl.BitchatDesktop"
 APP_NAME = "BitChat"
@@ -31,6 +123,7 @@ CSS = """
 .sender { font-weight: bold; font-size: 0.9em; }
 .meta { font-size: 0.78em; opacity: 0.7; }
 .system-line { font-size: 0.85em; opacity: 0.65; }
+.banner-compat { background-color: alpha(@accent_bg_color, 0.25); }
 .status-dot { min-width: 10px; min-height: 10px; border-radius: 5px; }
 .status-dot.on { background-color: @success_color; }
 .status-dot.wait { background-color: @warning_color; }
@@ -121,13 +214,15 @@ class BitchatWindow(Adw.ApplicationWindow):
     # ---------- UI construction ----------
     def _build(self):
         self.toasts = Adw.ToastOverlay()
-        self.split = Adw.NavigationSplitView(min_sidebar_width=250, max_sidebar_width=320)
+        self.split = SplitView(min_sidebar_width=250, max_sidebar_width=320)
         self.toasts.set_child(self.split)
         self.set_content(self.toasts)
 
         # Sidebar
-        sb_view = Adw.ToolbarView()
+        sb_view = ToolbarView()
         sb_header = Adw.HeaderBar()
+        if not MODERN:
+            sb_header.set_show_end_title_buttons(False)
         sb_header.set_title_widget(Adw.WindowTitle(title=APP_NAME, subtitle="Bluetooth mesh chat"))
         menu = Gio.Menu()
         menu.append("Change nickname…", "win.nick")
@@ -193,11 +288,13 @@ class BitchatWindow(Adw.ApplicationWindow):
         scroller.set_child(inner)
         side.append(scroller)
         sb_view.set_content(side)
-        self.split.set_sidebar(Adw.NavigationPage(title=APP_NAME, child=sb_view))
+        self.split.set_sidebar(NavigationPage(title=APP_NAME, child=sb_view))
 
         # Content
-        self.content_view = Adw.ToolbarView()
+        self.content_view = ToolbarView()
         ch = Adw.HeaderBar()
+        if not MODERN:
+            ch.set_show_start_title_buttons(False)
         self.conv_title = Adw.WindowTitle(title="Public", subtitle="")
         ch.set_title_widget(self.conv_title)
         self.leave_btn = Gtk.Button(icon_name="application-exit-symbolic", tooltip_text="Leave channel",
@@ -205,7 +302,7 @@ class BitchatWindow(Adw.ApplicationWindow):
         self.leave_btn.connect("clicked", lambda *_: self.leave_current())
         ch.pack_end(self.leave_btn)
         self.content_view.add_top_bar(ch)
-        self.banner = Adw.Banner(title="", revealed=False)
+        self.banner = Banner(title="", revealed=False)
         self.content_view.add_top_bar(self.banner)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -227,7 +324,7 @@ class BitchatWindow(Adw.ApplicationWindow):
         clampc = Adw.Clamp(maximum_size=820, tightening_threshold=600, child=composer)
         body.append(clampc)
         self.content_view.set_content(body)
-        self.content_page = Adw.NavigationPage(title="Public", child=self.content_view)
+        self.content_page = NavigationPage(title="Public", child=self.content_view)
         self.split.set_content(self.content_page)
 
         # public room row
@@ -242,9 +339,10 @@ class BitchatWindow(Adw.ApplicationWindow):
         self.connect("notify::is-active", lambda *_: self._maybe_mark_read())
 
         # breakpoint for narrow windows
-        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 600sp"))
-        bp.add_setter(self.split, "collapsed", True)
-        self.add_breakpoint(bp)
+        if MODERN:
+            bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 600sp"))
+            bp.add_setter(self.split, "collapsed", True)
+            self.add_breakpoint(bp)
 
     def _add_sidebar_row(self, listbox, key, title, subtitle, icon=None, dot=None):
         row = Adw.ActionRow(title=GLib.markup_escape_text(title), activatable=True)
@@ -709,8 +807,8 @@ class BitchatWindow(Adw.ApplicationWindow):
             self.send_cmd({"cmd": "leave", "channel": c.key})
 
     def ask_nick(self, first=False):
-        dlg = Adw.AlertDialog(heading="Choose a nickname" if first else "Change nickname",
-                              body="This is the name people nearby see. Anyone in Bluetooth range can see it, "
+        dlg = alert(self, "Choose a nickname" if first else "Change nickname",
+                    "This is the name people nearby see. Anyone in Bluetooth range can see it, "
                                    "so you may not want to use your full name.")
         entry = Gtk.Entry(text=self.my_nick if self.my_nick != "anonymous" else "", activates_default=True,
                           placeholder_text="e.g. dyl")
@@ -725,11 +823,11 @@ class BitchatWindow(Adw.ApplicationWindow):
             if resp == "ok" and name:
                 self.send_cmd({"cmd": "nick", "name": name})
         dlg.connect("response", done)
-        dlg.present(self)
+        present_dialog(dlg, self)
 
     def ask_join(self):
-        dlg = Adw.AlertDialog(heading="Join a location channel",
-                              body="BitChat channels are named after a place (a geohash, e.g. #r3gx for a city-sized area). "
+        dlg = alert(self, "Join a location channel",
+                    "BitChat channels are named after a place (a geohash, e.g. #r3gx for a city-sized area). "
                                    "Unlike the Bluetooth mesh, they travel over the internet via Nostr relays and anyone can read them.")
         entry = Gtk.Entry(placeholder_text="#geohash", activates_default=True)
         dlg.set_extra_child(entry)
@@ -743,16 +841,20 @@ class BitchatWindow(Adw.ApplicationWindow):
             if resp == "ok" and gh:
                 self.send_cmd({"cmd": "join", "channel": gh})
         dlg.connect("response", done)
-        dlg.present(self)
+        present_dialog(dlg, self)
 
     def about(self):
-        about = Adw.AboutDialog(application_name="BitChat Desktop", application_icon="bitchat-desktop",
+        about = (Adw.AboutDialog if MODERN else Adw.AboutWindow)(application_name="BitChat Desktop", application_icon="bitchat-desktop",
                                 version=VERSION, developer_name="Built for Dyl",
                                 comments="Off-grid chat over Bluetooth with nearby BitChat users.\n"
                                          "Backend: bitchat-desktopd, a fork of bitmancer (MIT).",
                                 license_type=Gtk.License.MIT_X11,
                                 website="https://github.com/permissionlesstech/bitchat")
-        about.present(self)
+        if MODERN:
+            about.present(self)
+        else:
+            about.set_transient_for(self)
+            about.present()
 
     def save_screenshot(self, path):
         """Render this window to a PNG without any desktop screenshot permission."""
@@ -799,7 +901,13 @@ class BitchatApp(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         provider = Gtk.CssProvider()
-        provider.load_from_string(CSS)
+        if hasattr(provider, "load_from_string"):
+            provider.load_from_string(CSS)
+        else:
+            try:
+                provider.load_from_data(CSS, -1)
+            except TypeError:
+                provider.load_from_data(CSS.encode())
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         q = Gio.SimpleAction.new("quit", None)
