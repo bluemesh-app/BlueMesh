@@ -567,6 +567,10 @@ class BitchatWindow(Adw.ApplicationWindow):
     # ---------- events from backend ----------
     def handle_event(self, ev):
         kind = ev.get("ev")
+        log = os.environ.get("BITCHAT_DESKTOP_EVENTLOG")
+        if log:
+            with open(log, "a") as f:
+                f.write(json.dumps(ev) + "\n")
         if kind == "ready":
             self.my_nick = ev.get("nickname", "")
             self.my_peer_id = ev.get("peer_id", "")
@@ -862,7 +866,11 @@ class BitchatWindow(Adw.ApplicationWindow):
         paintable = Gtk.WidgetPaintable(widget=self)
         snap = Gtk.Snapshot()
         paintable.snapshot(snap, w, h)
-        node = snap.to_node()
+        try:
+            node = snap.to_node()
+        except TypeError as e:  # PyGObject on GTK 4.8 can't wrap the node type
+            print("screenshot unavailable on this GTK:", e, file=sys.stderr)
+            return
         if node is None:
             print("screenshot: nothing to render", file=sys.stderr)
             return
