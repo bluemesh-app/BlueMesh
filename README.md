@@ -6,23 +6,61 @@ mesh chat. It speaks the open BitChat mesh wire protocol, so it can chat with
 BitChat-compatible devices nearby.
 
 Features: public mesh chat, end-to-end encrypted direct messages (Noise XX),
-favourites, mesh file transfer, and optional geohash "location channels" carried
-over Nostr relays (these use the internet and are public).
+favourites, private file transfer to accepted contacts, block list, emergency
+wipe, image preview, and optional geohash "location channels" carried over Nostr
+relays (these use the internet and are public).
 
-## File transfer
+## File transfer (accepted contacts only)
 
-Use the paperclip in the Public room (or *Menu → Send file to everyone nearby…*)
-to send a file over the Bluetooth mesh, the same way bitchat-tui / bitmancer
-`/send` does:
+Files only go to an **accepted contact**: a *mutual favourite* (you starred them
+and they starred you back). Open their chat and use the paperclip or the ⋮ menu.
 
-* Limit **1 MiB** per file. Larger, empty or unreadable files are refused with a message.
-* Files go to **everyone in range** and are **not encrypted**. There is no private
-  (DM) file path in the mesh yet. A 1 MiB file is several thousand Bluetooth
-  fragments, so expect it to take a while.
-* Received files are saved to `~/.local/share/bluemesh/received/` (folder mode 700,
-  files mode 600). The name is cleaned and never overwrites an existing file.
-  Nothing is opened automatically. Use **Open** or **Show in folder** in the chat.
-* Files over 64 KiB go out as v2 frames (4-byte length field), because a v1 frame can't hold them.
+* Sent **only to that person**, sealed inside your Noise session, using the same
+  wire format as BitChat Android's private media (Noise payload `0x20`, file TLV,
+  fragments addressed to the recipient). Relays only see ciphertext.
+* An encrypted session must be up first (send them a message).
+* Limit about **53 KiB** per private file: Android refuses to reassemble more than
+  256 fragments and BlueMesh sends 213-byte fragments. Bigger files are refused
+  with a message rather than lost on the phone.
+* **No broadcast files.** Sending a file to everyone in range is switched off;
+  `send_file` without a `peer_id` is refused by the backend.
+* **Receiving:** files are kept only from mutual favourites (private or broadcast).
+  Anything else is dropped unsaved with a notice "Ignored file … from non-contact".
+  Kept files go to `~/.local/share/bluemesh/received/` (folder mode 700, files 600),
+  with cleaned names that never overwrite. Nothing opens automatically: use
+  **Preview** (images, shown inside BlueMesh), **Open** or **Show in folder**.
+
+## Blocking
+
+Right-click (or long-press) a person, or use ⋮ → *Block…* in their chat. Their
+traffic is dropped by the mesh layer and their session closed. *Menu → Blocked
+people…* lists and unblocks. The list is saved in `state.json` (`blocked_peers`,
+SHA-256 fingerprints, same as the TUI). Names of blocked people are remembered
+for the current session only; after a restart they show as an ID.
+
+## Emergency wipe
+
+*Menu → Emergency wipe…*, type `CONFIRM`. The backend overwrites and deletes
+`~/.local/share/bluemesh/state.json` (identity and noise keys, Nostr seed,
+nickname, favourites, verified contacts, block list, recent channels), forgets all
+peers and sessions in memory, optionally deletes received files, and exits.
+The app then closes; the next launch creates a brand-new identity. The backend
+never wipes without `{"cmd":"wipe","confirm":true}`. A failed wipe reports that
+the keys are still on disk and does not quit.
+
+## Location channels
+
+*Menu → Browse location channels…* explains geohash precision, lets you type a
+channel and join it, and lists your last 10 channels (stored in `state.json`, so
+they're removed by a wipe) with their rough coordinates and activity if joined.
+The TUI's ASCII world map with live hotspots is **not** in the GTK app yet; it
+needs the map sampler that subscribes to many cells at once.
+
+## Slap
+
+Right-click a person → *Slap with a trout* sends the same public action line the
+phone app's `/slap` sends (`* you slaps them around a bit with a large trout 🐟 *`).
+It's an ordinary public message, not a protocol feature.
 
 ## Password-protected channels
 
@@ -52,16 +90,18 @@ and a Rust toolchain to build the backend.
 Then launch **BlueMesh** from the app grid, or run `bluemesh`.
 
 Identity and keys are stored in `~/.local/share/bluemesh/state.json` (mode 600).
-Messages are not saved to disk. Received files are (see File transfer).
+Messages are not saved to disk. Received files from contacts are (see File transfer).
 
 ## Backend protocol
 
 Commands (stdin): send{text} · dm{peer_id,text} · read{peer_id,ids} · nick{name} ·
 join{channel} · leave{channel} · channel_send{channel,text} · favorite{peer_id,on} ·
-send_file{path} · peers · quit.
+send_file{path,peer_id} · block{peer} · unblock{peer} · blocks · wipe{confirm,files} ·
+channels · peers · quit.
 Events (stdout): ready, status, peripheral, peers, peer_joined/left, public, dm, sent
 (kind public/dm/channel/file), file_sending{name,size,parts},
-file{name,path,size,sender,peer_id,ts,mime,kind}, delivery,
+file{name,path,size,sender,peer_id,ts,mime,kind,private}, file_ignored{sender,name,private},
+blocked, unblocked, blocks{blocked[]}, wiped{ok,existed,files_removed}, channels{joined,recent}, delivery,
 session_up, nick, favorite, channel_joined/left/msg/people/live, notice, error, log, bye.
 
 ## License

@@ -113,7 +113,11 @@ APP_ID = "app.bluemesh.BlueMesh"
 APP_NAME = "BlueMesh"
 VERSION = "0.1.0"
 PUBLIC = "public"
-MAX_FILE_BYTES = 1024 * 1024   # mesh file-transfer limit (bluemeshd enforces it too)
+MAX_FILE_BYTES = 1024 * 1024   # absolute mesh file limit (bluemeshd enforces it too)
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+SLAP_TEXT = "* {me} slaps {them} around a bit with a large trout 🐟 *"   # same wording as the phone app's /slap
+CHANNEL_LEVELS = [("2", "region (e.g. #r3)"), ("4", "province / state (#r3gx)"), ("5", "city (#r3gx2)"),
+                  ("6", "neighbourhood (#r3gx2f)"), ("7", "block (#r3gx2f9)"), ("8", "building (#r3gx2f9t)")]
 
 CSS = """
 .bubble { padding: 7px 11px; border-radius: 14px; }
@@ -255,10 +259,16 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         sb_header.set_title_widget(Adw.WindowTitle(title=APP_NAME, subtitle="Bluetooth mesh chat"))
         menu = Gio.Menu()
         menu.append("Change nickname…", "win.nick")
-        menu.append("Join location channel…", "win.join")
-        menu.append("Send file to everyone nearby…", "win.sendfile")
+        menu.append("Browse location channels…", "win.browse")
+        menu.append("Send file to this contact…", "win.sendfile")
+        menu.append("Blocked people…", "win.blocks")
         menu.append("Reconnect", "win.reconnect")
-        menu.append("About BlueMesh", "win.about")
+        danger = Gio.Menu()
+        danger.append("Emergency wipe…", "win.wipe")
+        menu.append_section(None, danger)
+        about = Gio.Menu()
+        about.append("About BlueMesh", "win.about")
+        menu.append_section(None, about)
         mb = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
         sb_header.pack_end(mb)
         sb_view.add_top_bar(sb_header)
@@ -336,6 +346,13 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         self.fav_btn.connect("clicked", lambda *_: self.current and self.current.startswith("dm:")
                              and self.toggle_favorite(self.current[3:]))
         ch.pack_end(self.fav_btn)
+        dm_menu = Gio.Menu()
+        dm_menu.append("Send file…", "win.sendfile")
+        dm_menu.append("Slap with a trout", "win.slap-current")
+        dm_menu.append("Block…", "win.block-current")
+        self.dm_menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=dm_menu,
+                                          tooltip_text="More", visible=False)
+        ch.pack_end(self.dm_menu_btn)
         self.content_view.add_top_bar(ch)
         self.banner = Banner(title="", revealed=False)
         self.content_view.add_top_bar(self.banner)
@@ -349,7 +366,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         composer = Gtk.Box(spacing=8, css_classes=["composer"])
         self.attach_btn = Gtk.Button(icon_name="mail-attachment-symbolic", css_classes=["flat", "circular"],
                                      valign=Gtk.Align.CENTER,
-                                     tooltip_text="Send a file to everyone nearby (up to 1 MiB, not encrypted)")
+                                     tooltip_text="Send a file to this contact (mutual favourites only, encrypted)")
         self.attach_btn.connect("clicked", lambda *_: self.choose_file())
         composer.append(self.attach_btn)
         self.entry = Gtk.Entry(hexpand=True, placeholder_text="Message everyone nearby…")
@@ -372,10 +389,25 @@ class BlueMeshWindow(Adw.ApplicationWindow):
 
         for name, cb in (("nick", lambda *_: self.ask_nick()), ("join", lambda *_: self.ask_join()),
                          ("reconnect", lambda *_: self.restart_backend()), ("about", lambda *_: self.about()),
-                         ("sendfile", lambda *_: self.choose_file(switch=True))):
+                         ("sendfile", lambda *_: self.choose_file()),
+                         ("browse", lambda *_: self.browse_channels()),
+                         ("blocks", lambda *_: self.show_blocks()),
+                         ("wipe", lambda *_: self.ask_wipe()),
+                         ("block-current", lambda *_: self.current and self.current.startswith("dm:")
+                          and self.ask_block(self.current[3:])),
+                         ("slap-current", lambda *_: self.current and self.current.startswith("dm:")
+                          and self.slap(self.current[3:]))):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
             self.add_action(a)
+        for name, cb in (("block-peer", lambda pid: self.ask_block(pid)), ("slap-peer", lambda pid: self.slap(pid))):
+            a = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
+            a.connect("activate", lambda _a, v, cb=cb: cb(v.get_string()))
+            self.add_action(a)
+        self.blocks_dialog = None
+        self.blocks_box = None
+        self.channels_dialog = None
+        self.channels_box = None
         self.connect("close-request", self._on_close)
         self.connect("notify::is-active", lambda *_: self._maybe_mark_read())
 
@@ -403,7 +435,33 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             row.add_suffix(self._star_button(pid, on))
         listbox.append(row)
         self.sidebar_rows[key] = (row, unread, dotw)
+        if key.startswith("dm:"):
+            self._attach_peer_menu(row, key[3:])
         return row
+
+    def _attach_peer_menu(self, row, pid):
+        """Right-click (or long-press) a person for Slap / Block."""
+        m = Gio.Menu()
+        m.append("Slap with a trout", f"win.slap-peer('{pid}')")
+        m.append("Block…", f"win.block-peer('{pid}')")
+        pop = Gtk.PopoverMenu.new_from_model(m)
+        pop.set_parent(row)
+        pop.set_has_arrow(False)
+        row.connect("destroy", lambda *_: pop.unparent())
+
+        def show(_g, _n, x, y):
+            if pid not in self.peers or self.peers[pid].get("offline"):
+                return
+            r = Gdk.Rectangle()
+            r.x, r.y, r.width, r.height = int(x), int(y), 1, 1
+            pop.set_pointing_to(r)
+            pop.popup()
+        g = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        g.connect("pressed", show)
+        row.add_controller(g)
+        lp = Gtk.GestureLongPress()
+        lp.connect("pressed", lambda _g, x, y: show(_g, 1, x, y))
+        row.add_controller(lp)
 
     # ---------- favourites ----------
     def _star_button(self, pid, on):
@@ -450,7 +508,8 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         c = Conversation(key, title, kind)
         if kind == "public":
             c.empty.set_label("No messages yet.\nPublic messages reach every nearby mesh peer in Bluetooth range — "
-                              "including strangers — and are not encrypted.")
+                              "including strangers — and are not encrypted.\n"
+                              "Files can't be sent here: open a chat with a mutual favourite to send one.")
         elif kind == "channel":
             c.empty.set_label(f"Location channel {key}.\nThis room is carried over the internet (Nostr relays), "
                               "not Bluetooth. Anyone in the world can read it.")
@@ -468,7 +527,8 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         self.conv_title.set_title(c.title)
         self.content_page.set_title(c.title)
         self.leave_btn.set_visible(c.kind == "channel")
-        self.attach_btn.set_visible(c.kind == "public")
+        self.attach_btn.set_visible(c.kind == "dm")
+        self.dm_menu_btn.set_visible(c.kind == "dm")
         self._update_fav_header()
         if c.kind == "public":
             n = sum(1 for p in self.peers.values() if not p.get("offline"))
@@ -566,17 +626,21 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             self._scroll_bottom()
         return bubble, st
 
-    def add_file_row(self, key, sender, name, size, ts, path=None, mine=False, status=None):
+    def add_file_row(self, key, sender, name, size, ts, path=None, mine=False, status=None, kind=None):
         """A chat bubble for a file: name + size, and for received files
-        Open / Show in folder buttons. Nothing is ever opened automatically."""
+        Preview (images) / Open / Show in folder buttons. Nothing is ever opened automatically."""
         bubble, st = self.add_message(key, sender, f"📎 {name}", ts, mine=mine, status=status)
         body = bubble.get_first_child()
         body.add_css_class("file-name")
-        info = Gtk.Label(label=human_size(size) + ("" if mine else " · saved to received files"),
+        info = Gtk.Label(label=human_size(size) + ("" if mine else " · saved to received files (quarantine)"),
                          xalign=0, css_classes=["meta"])
         bubble.insert_child_after(info, body)
         if path and not mine:
             row = Gtk.Box(spacing=6, css_classes=["file-actions"], margin_top=2)
+            if kind == "image" or name.lower().endswith(IMAGE_EXTS):
+                pb = Gtk.Button(label="Preview", tooltip_text=f"View {name} inside BlueMesh")
+                pb.connect("clicked", lambda *_: self.preview_image(path, name))
+                row.append(pb)
             ob = Gtk.Button(label="Open", tooltip_text=f"Open {name} with its default app")
             ob.connect("clicked", lambda *_: self.open_file(path))
             fb = Gtk.Button(label="Show in folder", tooltip_text=path)
@@ -585,6 +649,39 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             row.append(fb)
             bubble.insert_child_after(row, info)
         return bubble, st
+
+    def preview_image(self, path, name):
+        """Shows a received image in its own window. Decoded only when asked."""
+        if not os.path.isfile(path):
+            self.toast("That file is no longer there")
+            return
+        try:
+            if os.path.getsize(path) > MAX_FILE_BYTES:
+                self.toast("That image is too large to preview")
+                return
+            tex = Gdk.Texture.new_from_filename(path)
+        except (GLib.Error, OSError) as e:
+            self.toast(f"Couldn't show it as an image: {getattr(e, 'message', None) or e}")
+            return
+        w, h = tex.get_width(), tex.get_height()
+        scale = min(1.0, 900 / max(w, 1), 700 / max(h, 1))
+        win = Adw.Window(transient_for=self, modal=False, title=name,
+                         default_width=max(240, int(w * scale)), default_height=max(180, int(h * scale) + 46))
+        view = ToolbarView()
+        hb = Adw.HeaderBar()
+        hb.set_title_widget(Adw.WindowTitle(title=name, subtitle=f"{w}×{h}"))
+        view.add_top_bar(hb)
+        pic = Gtk.Picture.new_for_paintable(tex)
+        pic.set_can_shrink(True)
+        if hasattr(pic, "set_content_fit"):
+            pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+        view.set_content(pic)
+        win.set_content(view)
+        esc = Gtk.ShortcutController()
+        esc.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("Escape"),
+                                          Gtk.CallbackAction.new(lambda *_: (win.close(), True)[1])))
+        win.add_controller(esc)
+        win.present()
 
     def open_file(self, path):
         if not os.path.isfile(path):
@@ -764,14 +861,46 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         elif kind == "file":
             sender = ev.get("sender", "?")
             name = ev.get("name", "file")
+            key = PUBLIC
+            if ev.get("private") and ev.get("peer_id"):
+                key = f"dm:{ev['peer_id']}"
+                self._conv(key, sender, "dm")
+                self._ensure_dm_row(ev["peer_id"], sender)
             if ev.get("path"):
-                self.add_file_row(PUBLIC, sender, name, ev.get("size", 0), ev.get("ts", time.time()),
-                                  path=ev.get("path"))
+                self.add_file_row(key, sender, name, ev.get("size", 0), ev.get("ts", time.time()),
+                                  path=ev.get("path"), kind=ev.get("kind"))
             else:
-                self.add_system(PUBLIC, f"{sender} sent {name} ({human_size(ev.get('size', 0))}) "
-                                        f"but it couldn't be saved: {ev.get('error', 'unknown error')}")
-            self.bump_unread(PUBLIC)
-            self.notify(f"{sender} (Public)", f"Sent a file: {name}", PUBLIC)
+                self.add_system(key, f"{sender} sent {name} ({human_size(ev.get('size', 0))}) "
+                                     f"but it couldn't be saved: {ev.get('error', 'unknown error')}")
+            self.bump_unread(key)
+            self.notify(f"{sender} ({'private' if key != PUBLIC else 'Public'})", f"Sent a file: {name}", key)
+        elif kind == "file_ignored":
+            sender = ev.get("sender", "?")
+            key = f"dm:{ev.get('peer_id')}" if ev.get("private") and f"dm:{ev.get('peer_id')}" in self.convs else PUBLIC
+            self.add_system(key, f"Ignored file “{ev.get('name', 'file')}” from non-contact {sender} "
+                                 f"(only mutual favourites can send you files). Nothing was saved.")
+        elif kind == "blocked":
+            if ev.get("ok"):
+                nick = ev.get("nickname", "")
+                self.toast(f"Blocked {nick}. Their messages are dropped.")
+                key = f"dm:{ev.get('peer_id')}"
+                if key in self.convs:
+                    self.add_system(key, f"You blocked {nick}.")
+                if not ev.get("saved", True):
+                    self.toast("Blocked for now, but couldn't save the block list")
+            else:
+                self.toast(f"Couldn't block: {ev.get('error', 'error')}")
+        elif kind == "unblocked":
+            if ev.get("ok"):
+                self.toast(f"Unblocked {ev.get('nickname', '')}")
+            else:
+                self.toast(f"Couldn't unblock: {ev.get('error', 'error')}")
+        elif kind == "blocks":
+            self._fill_blocks(ev.get("blocked", []))
+        elif kind == "channels":
+            self._fill_channels(ev)
+        elif kind == "wiped":
+            self._on_wiped(ev)
         elif kind == "delivery":
             lab = self.by_msgid.get(ev.get("message_id"))
             if lab:
@@ -862,8 +991,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             return
         k = ev.get("kind")
         if k == "file":
-            n = ev.get("links", 0)
-            st.set_label(f"Sent ✓ ({n} link{'s' if n != 1 else ''})")
+            st.set_label("Sent 🔒 ✓")
         elif k == "public":
             n = ev.get("links", 0)
             st.set_label(f"Sent ✓ ({n} link{'s' if n != 1 else ''})")
@@ -984,58 +1112,254 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             st.set_label("Not sent")
             self.pending.pop(req, None)
 
-    def choose_file(self, switch=False):
-        if self.current != PUBLIC:
-            if not switch:
-                return
-            self.select_conv(PUBLIC)
-            self.toast("Files go to everyone nearby in Public")
-        title = "Send a file to everyone nearby"
+    def _file_target_problem(self, pid):
+        """Why a file can't go to this person right now, or None if it can."""
+        p = self.peers.get(pid)
+        if not p or p.get("offline"):
+            return "They aren't in range right now"
+        if not (p.get("mutual") or (p.get("favorite") and p.get("favorited_us"))):
+            return ("Files only go to mutual favourites. Star them, and they need to star you back")
+        if not p.get("encrypted"):
+            return "No encrypted session yet. Send them a message first, then try again"
+        return None
+
+    def choose_file(self):
+        key = self.current or ""
+        if not key.startswith("dm:"):
+            self.toast("Open a chat with a mutual favourite to send them a file")
+            return
+        pid = key[3:]
+        problem = self._file_target_problem(pid)
+        if problem:
+            self.toast(problem)
+            return
+        nick = self.peers.get(pid, {}).get("nickname", "them")
+        title = f"Send a file to {nick}"
         if hasattr(Gtk, "FileDialog"):
             dlg = Gtk.FileDialog(title=title, modal=True, accept_label="Send")
-            dlg.open(self, None, self._file_chosen)
+            dlg.open(self, None, lambda d, r: self._file_chosen(d, r, pid))
         else:
             dlg = Gtk.FileChooserNative(title=title, transient_for=self, modal=True,
                                         action=Gtk.FileChooserAction.OPEN, accept_label="Send")
             def resp(d, r):
                 if r == Gtk.ResponseType.ACCEPT and d.get_file():
-                    self.send_file(d.get_file().get_path())
+                    self.send_file(d.get_file().get_path(), pid)
                 d.destroy()
             dlg.connect("response", resp)
             self._chooser = dlg  # keep a reference while it is open
             dlg.show()
 
-    def _file_chosen(self, dlg, res):
+    def _file_chosen(self, dlg, res, pid):
         try:
             f = dlg.open_finish(res)
         except GLib.Error:
             return  # cancelled
         if f and f.get_path():
-            self.send_file(f.get_path())
+            self.send_file(f.get_path(), pid)
         elif f:
             self.toast("Only local files can be sent")
 
-    def send_file(self, path):
+    def send_file(self, path, pid):
+        """Sends a file to one mutual favourite, sealed in the Noise session.
+        There is no broadcast path: bluemeshd refuses a send without a peer."""
         name = os.path.basename(path)
+        problem = self._file_target_problem(pid)
+        if problem:
+            self.toast(problem)
+            return
         try:
             size = os.path.getsize(path)
         except OSError as e:
             self.toast(f"Couldn't read {name}: {e.strerror}")
             return
         if size > MAX_FILE_BYTES:
-            self.toast(f"{name} is {human_size(size)} — mesh files are limited to 1 MiB")
+            self.toast(f"{name} is {human_size(size)}, too big for the mesh")
             return
         if size == 0:
             self.toast(f"{name} is empty")
             return
+        key = f"dm:{pid}"
+        self._conv(key, self.peers.get(pid, {}).get("nickname", pid[:8]), "dm")
         self.req_seq += 1
         req = self.req_seq
-        bubble, st = self.add_file_row(PUBLIC, self.my_nick, name, size, time.time(), mine=True, status="Sending…")
+        bubble, st = self.add_file_row(key, self.my_nick, name, size, time.time(), mine=True, status="Sending…")
         self.pending[req] = (bubble, st)
-        if not self.send_cmd({"cmd": "send_file", "path": path, "req": req}):
+        if not self.send_cmd({"cmd": "send_file", "path": path, "peer_id": pid, "req": req}):
             bubble.add_css_class("failed")
             st.set_label("Not sent")
             self.pending.pop(req, None)
+
+    # ---------- block / slap ----------
+    def ask_block(self, pid):
+        p = self.peers.get(pid)
+        if not p or p.get("offline"):
+            self.toast("You can only block someone who is in range")
+            return
+        nick = p.get("nickname", pid[:8])
+        dlg = alert(self, f"Block {nick}?",
+                    f"You won't see anything {nick} sends, they disappear from your people list, and any "
+                    "encrypted session with them is closed. You can undo this from Menu → Blocked people.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("block", "Block")
+        dlg.set_response_appearance("block", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.connect("response", lambda d, r: r == "block" and self.send_cmd({"cmd": "block", "peer": pid}))
+        present_dialog(dlg, self)
+
+    def show_blocks(self):
+        dlg = alert(self, "Blocked people", "People you've blocked. Unblocking lets their messages through again.")
+        self.blocks_box = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        self.blocks_box.set_placeholder(Gtk.Label(label="Nobody is blocked", margin_top=12, margin_bottom=12,
+                                                  css_classes=["dim-label"]))
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                max_content_height=320, child=self.blocks_box)
+        dlg.set_extra_child(sc)
+        dlg.add_response("close", "Close")
+        dlg.set_default_response("close")
+        dlg.set_close_response("close")
+
+        def closed(*_):
+            self.blocks_dialog = None
+            self.blocks_box = None
+        dlg.connect("response", closed)
+        self.blocks_dialog = dlg
+        present_dialog(dlg, self)
+        self.send_cmd({"cmd": "blocks"})
+
+    def _fill_blocks(self, blocked):
+        if not self.blocks_box:
+            return
+        while (child := self.blocks_box.get_first_child()) is not None:
+            self.blocks_box.remove(child)
+        for b in blocked:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(b.get("nickname", "")),
+                                subtitle=GLib.markup_escape_text(f"ID {b.get('peer_id', '')[:8]}"))
+            btn = Gtk.Button(label="Unblock", valign=Gtk.Align.CENTER)
+            fp = b.get("fingerprint", "")
+            btn.connect("clicked", lambda *_, fp=fp: self.send_cmd({"cmd": "unblock", "peer": fp}))
+            row.add_suffix(btn)
+            self.blocks_box.append(row)
+
+    def slap(self, pid):
+        p = self.peers.get(pid)
+        if not p or p.get("offline"):
+            self.toast("They aren't in range")
+            return
+        text = SLAP_TEXT.format(me=self.my_nick or "someone", them=p.get("nickname", pid[:8]))
+        self.select_conv(PUBLIC)
+        self.entry.set_text(text)
+        self.send_current()
+
+    # ---------- emergency wipe ----------
+    def ask_wipe(self):
+        dlg = alert(self, "Emergency wipe",
+                    "This permanently destroys this computer's BlueMesh identity: your keys, nickname, "
+                    "favourites, verified contacts, block list and recent location channels. "
+                    "People will no longer recognise you. This can't be undone.\n\n"
+                    "BlueMesh closes afterwards; the next launch starts with a brand-new identity.\n\n"
+                    "Type CONFIRM to continue.")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        entry = Gtk.Entry(placeholder_text="CONFIRM")
+        files = Gtk.CheckButton(label="Also delete received files")
+        box.append(entry)
+        box.append(files)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("wipe", "Wipe everything")
+        dlg.set_response_appearance("wipe", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_response_enabled("wipe", False)
+        dlg.set_default_response("cancel")
+        entry.connect("changed", lambda e: dlg.set_response_enabled("wipe", e.get_text().strip() == "CONFIRM"))
+
+        def done(d, r):
+            if r == "wipe" and entry.get_text().strip() == "CONFIRM":
+                self.send_cmd({"cmd": "wipe", "confirm": True, "files": files.get_active()})
+        dlg.connect("response", done)
+        present_dialog(dlg, self)
+
+    def _on_wiped(self, ev):
+        if not ev.get("ok"):
+            self.toast(ev.get("error", "Wipe failed"))
+            return
+        self.stopping = True
+        self.peers = {}
+        for key in [k for k in self.convs if k != PUBLIC]:
+            self.convs.pop(key, None)
+        self.my_nick = ""
+        self._refresh_people()
+        msg = "Your identity, keys, favourites and block list are gone."
+        if ev.get("files_removed"):
+            msg += " Received files were deleted."
+        dlg = alert(self, "Identity destroyed", msg + " BlueMesh will now close.")
+        dlg.add_response("ok", "Close BlueMesh")
+        dlg.connect("response", lambda *_: self.app.quit())
+        present_dialog(dlg, self)
+        GLib.timeout_add_seconds(10, lambda: (self.app.quit(), False)[1])
+
+    # ---------- location channels ----------
+    def browse_channels(self):
+        levels = "\n".join(f"  {n} characters: {label}" for n, label in CHANNEL_LEVELS)
+        dlg = alert(self, "Location channels",
+                    "Channels are named after a place (a geohash). Longer = smaller area:\n" + levels +
+                    "\n\nThey travel over the internet (Nostr relays), not Bluetooth, and anyone can read them.")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        entry_row = Gtk.Box(spacing=6)
+        entry = Gtk.Entry(placeholder_text="#geohash", hexpand=True)
+        join = Gtk.Button(label="Join", css_classes=["suggested-action"])
+
+        def do_join(*_):
+            gh = entry.get_text().strip().lstrip("#").lower()
+            if gh:
+                self.send_cmd({"cmd": "join", "channel": gh})
+                dlg.close() if hasattr(dlg, "close") else None
+        join.connect("clicked", do_join)
+        entry.connect("activate", do_join)
+        entry_row.append(entry)
+        entry_row.append(join)
+        box.append(entry_row)
+        self.channels_box = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        self.channels_box.set_placeholder(Gtk.Label(label="No recent channels", margin_top=10, margin_bottom=10,
+                                                    css_classes=["dim-label"]))
+        box.append(Gtk.Label(label="Recent", xalign=0, css_classes=["caption-heading", "dim-label"]))
+        box.append(Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                      max_content_height=260, child=self.channels_box))
+        dlg.set_extra_child(box)
+        dlg.add_response("close", "Close")
+        dlg.set_default_response("close")
+        dlg.set_close_response("close")
+
+        def closed(*_):
+            self.channels_dialog = None
+            self.channels_box = None
+        dlg.connect("response", closed)
+        self.channels_dialog = dlg
+        present_dialog(dlg, self)
+        self.send_cmd({"cmd": "channels"})
+
+    def _fill_channels(self, ev):
+        if not self.channels_box:
+            return
+        while (child := self.channels_box.get_first_child()) is not None:
+            self.channels_box.remove(child)
+        people = {j.get("channel"): j.get("people", 0) for j in ev.get("joined", [])}
+        for r in ev.get("recent", []):
+            ch = r.get("channel", "")
+            sub = f"≈ {r.get('lat')}, {r.get('lon')}"
+            if ch in people:
+                sub = f"Joined · {people[ch]} active · " + sub
+            row = Adw.ActionRow(title=GLib.markup_escape_text(ch), subtitle=GLib.markup_escape_text(sub))
+            btn = Gtk.Button(label="Open" if ch in people else "Join", valign=Gtk.Align.CENTER)
+
+            def go(*_, ch=ch):
+                if ch in self.convs:
+                    self.select_conv(ch)
+                else:
+                    self.send_cmd({"cmd": "join", "channel": ch.lstrip("#")})
+                if self.channels_dialog is not None:
+                    self.channels_dialog.close()
+            btn.connect("clicked", go)
+            row.add_suffix(btn)
+            self.channels_box.append(row)
 
     def _maybe_mark_read(self):
         if not self.is_active() or not self.current or not self.current.startswith("dm:"):
@@ -1229,9 +1553,15 @@ class BlueMeshApp(Adw.Application):
             GLib.timeout_add_seconds(int(secs), try_fav)
         sf = os.environ.get("BLUEMESH_SELFTEST_FILE")
         if sf:
-            # "seconds|path": send that file to Public
-            secs, _, fpath = sf.partition("|")
-            GLib.timeout_add_seconds(int(secs), lambda: (self.win.send_file(fpath), False)[1])
+            # "seconds|nick|path": send that file to a mutual favourite
+            secs, nick, fpath = (sf.split("|", 2) + ["", ""])[:3]
+
+            def try_file():
+                pid = next((k for k, p in self.win.peers.items() if p.get("nickname") == nick), None)
+                if pid:
+                    self.win.send_file(fpath, pid)
+                return False
+            GLib.timeout_add_seconds(int(secs), try_file)
         rc = os.environ.get("BLUEMESH_SELFTEST_RECONNECT")
         if rc:
             GLib.timeout_add_seconds(int(rc), lambda: (self.win.restart_backend(), False)[1])
