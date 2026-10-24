@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""BitChat Desktop — a GTK4/libadwaita front end for the BitChat Bluetooth mesh.
+"""BlueMesh — a GTK4/libadwaita Bluetooth mesh chat client (BitChat wire protocol compatible).
 
-The radio and protocol live in `bitchat-desktopd` (a fork of bitmancer, the
-Rust BitChat client), which this window drives over line-delimited JSON on
+The radio and protocol live in `bluemeshd` (a fork of bitmancer, the
+Rust mesh client), which this window drives over line-delimited JSON on
 stdin/stdout. No terminal, pty or screen-scraping is involved.
 """
 import json
@@ -19,7 +19,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 # libadwaita >= 1.4 gets the native adaptive widgets; older releases (Debian
 # Bookworm ships 1.2) get small stand-ins with the same method names.
-MODERN = (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 4) and not os.environ.get("BITCHAT_DESKTOP_FORCE_COMPAT")
+MODERN = (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 4) and not os.environ.get("BLUEMESH_FORCE_COMPAT")
 
 
 class ToolbarViewCompat(Gtk.Box):
@@ -109,8 +109,8 @@ def present_dialog(dlg, parent):
     else:
         dlg.present()
 
-APP_ID = "com.dyl.BitchatDesktop"
-APP_NAME = "BitChat"
+APP_ID = "app.bluemesh.BlueMesh"
+APP_NAME = "BlueMesh"
 VERSION = "0.1.0"
 PUBLIC = "public"
 
@@ -158,11 +158,11 @@ def hhmm(ts):
 
 def find_backend():
     here = os.path.dirname(os.path.realpath(__file__))
-    for cand in (os.environ.get("BITCHAT_DESKTOPD"),
-                 os.path.join(here, "bitchat-desktopd"),
-                 os.path.expanduser("~/.local/bin/bitchat-desktopd"),
-                 shutil.which("bitchat-desktopd"),
-                 os.path.join(here, "..", "backend", "target", "release", "bitchat-desktopd")):
+    for cand in (os.environ.get("BLUEMESHD"),
+                 os.path.join(here, "bluemeshd"),
+                 os.path.expanduser("~/.local/bin/bluemeshd"),
+                 shutil.which("bluemeshd"),
+                 os.path.join(here, "..", "backend", "target", "release", "bluemeshd")):
         if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
     return None
@@ -187,7 +187,19 @@ class Conversation:
         self.people = []          # for channels
 
 
-class BitchatWindow(Adw.ApplicationWindow):
+def license_text():
+    """The shipped LICENSE (MIT + preserved third-party notices), if installed."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "LICENSE"), os.path.join(here, "..", "LICENSE")):
+        try:
+            with open(cand, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            pass
+    return None
+
+
+class BlueMeshWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title=APP_NAME, default_width=980, default_height=680,
                          width_request=360, height_request=420)
@@ -230,7 +242,7 @@ class BitchatWindow(Adw.ApplicationWindow):
         menu.append("Change nickname…", "win.nick")
         menu.append("Join location channel…", "win.join")
         menu.append("Reconnect", "win.reconnect")
-        menu.append("About BitChat Desktop", "win.about")
+        menu.append("About BlueMesh", "win.about")
         mb = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
         sb_header.pack_end(mb)
         sb_view.add_top_bar(sb_header)
@@ -415,7 +427,7 @@ class BitchatWindow(Adw.ApplicationWindow):
             return self.convs[key]
         c = Conversation(key, title, kind)
         if kind == "public":
-            c.empty.set_label("No messages yet.\nPublic messages reach every BitChat user in Bluetooth range — "
+            c.empty.set_label("No messages yet.\nPublic messages reach every nearby mesh peer in Bluetooth range — "
                               "including strangers — and are not encrypted.")
         elif kind == "channel":
             c.empty.set_label(f"Location channel {key}.\nThis room is carried over the internet (Nostr relays), "
@@ -542,7 +554,7 @@ class BitchatWindow(Adw.ApplicationWindow):
     def start_backend(self):
         path = find_backend()
         if not path:
-            self.set_status("err", "Backend missing", "bitchat-desktopd not found")
+            self.set_status("err", "Backend missing", "bluemeshd not found")
             return
         self.stopping = False
         try:
@@ -615,7 +627,7 @@ class BitchatWindow(Adw.ApplicationWindow):
     # ---------- events from backend ----------
     def handle_event(self, ev):
         kind = ev.get("ev")
-        log = os.environ.get("BITCHAT_DESKTOP_EVENTLOG")
+        log = os.environ.get("BLUEMESH_EVENTLOG")
         if log:
             with open(log, "a") as f:
                 f.write(json.dumps(ev) + "\n")
@@ -825,7 +837,7 @@ class BitchatWindow(Adw.ApplicationWindow):
     def _update_me(self):
         vis = "  ·  visible" if getattr(self, "visible", False) else ""
         self.me_label.set_label(f"You: {self.my_nick}  ·  ID {self.my_peer_id[:8]}{vis}")
-        self.me_label.set_tooltip_text("Other BitChat devices can connect to this computer" if vis else
+        self.me_label.set_tooltip_text("Other mesh devices can connect to this computer" if vis else
                                        "Only outgoing connections (to phones) are possible")
 
     def set_status(self, dot, title, sub, detail=None):
@@ -894,7 +906,7 @@ class BitchatWindow(Adw.ApplicationWindow):
                     "This is the name people nearby see. Anyone in Bluetooth range can see it, "
                                    "so you may not want to use your full name.")
         entry = Gtk.Entry(text=self.my_nick if self.my_nick != "anonymous" else "", activates_default=True,
-                          placeholder_text="e.g. dyl")
+                          placeholder_text="e.g. sam")
         dlg.set_extra_child(entry)
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("ok", "Save")
@@ -910,7 +922,7 @@ class BitchatWindow(Adw.ApplicationWindow):
 
     def ask_join(self):
         dlg = alert(self, "Join a location channel",
-                    "BitChat channels are named after a place (a geohash, e.g. #r3gx for a city-sized area). "
+                    "Location channels are named after a place (a geohash, e.g. #r3gx for a city-sized area). "
                                    "Unlike the Bluetooth mesh, they travel over the internet via Nostr relays and anyone can read them.")
         entry = Gtk.Entry(placeholder_text="#geohash", activates_default=True)
         dlg.set_extra_child(entry)
@@ -927,12 +939,14 @@ class BitchatWindow(Adw.ApplicationWindow):
         present_dialog(dlg, self)
 
     def about(self):
-        about = (Adw.AboutDialog if MODERN else Adw.AboutWindow)(application_name="BitChat Desktop", application_icon="bitchat-desktop",
-                                version=VERSION, developer_name="Built for Dyl",
-                                comments="Off-grid chat over Bluetooth with nearby BitChat users.\n"
-                                         "Backend: bitchat-desktopd, a fork of bitmancer (MIT).",
-                                license_type=Gtk.License.MIT_X11,
-                                website="https://github.com/permissionlesstech/bitchat")
+        about = (Adw.AboutDialog if MODERN else Adw.AboutWindow)(application_name="BlueMesh", application_icon="bluemesh",
+                                version=VERSION, developer_name="BlueMesh contributors",
+                                comments="Off-grid chat over Bluetooth mesh with nearby devices.\nWorks with nearby BlueMesh / BitChat-compatible devices.\n"
+                                         "Backend: bluemeshd, a fork of bitmancer (MIT). See License for full notices.",
+                                license_type=Gtk.License.MIT_X11)
+        lic = license_text()
+        if lic:
+            about.set_license(lic)  # full LICENSE incl. bitmancer / BitChat TUI notices
         if MODERN:
             about.present(self)
         else:
@@ -978,7 +992,7 @@ class BitchatWindow(Adw.ApplicationWindow):
         return False
 
 
-class BitchatApp(Adw.Application):
+class BlueMeshApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         GLib.set_application_name(APP_NAME)
@@ -1011,14 +1025,14 @@ class BitchatApp(Adw.Application):
 
     def do_activate(self):
         if not self.win:
-            self.win = BitchatWindow(self)
+            self.win = BlueMeshWindow(self)
         self.win.present()
         # Hidden developer hooks, used for automated testing only.
-        shot = os.environ.get("BITCHAT_DESKTOP_SCREENSHOT")
+        shot = os.environ.get("BLUEMESH_SCREENSHOT")
         if shot:
-            GLib.timeout_add_seconds(int(os.environ.get("BITCHAT_DESKTOP_SCREENSHOT_DELAY", "20")),
+            GLib.timeout_add_seconds(int(os.environ.get("BLUEMESH_SCREENSHOT_DELAY", "20")),
                                      lambda: (self.win.save_screenshot(shot), False)[1])
-        dmtest = os.environ.get("BITCHAT_DESKTOP_SELFTEST_DM")
+        dmtest = os.environ.get("BLUEMESH_SELFTEST_DM")
         if dmtest:
             nick, _, text = dmtest.partition("|")
 
@@ -1033,8 +1047,8 @@ class BitchatApp(Adw.Application):
                 self.win.entry.set_text(text)
                 self.win.send_current()
                 return False
-            GLib.timeout_add_seconds(int(os.environ.get("BITCHAT_DESKTOP_SELFTEST_DM_DELAY", "15")), try_dm)
-        for spec in filter(None, os.environ.get("BITCHAT_DESKTOP_SHOTS", "").split(";")):
+            GLib.timeout_add_seconds(int(os.environ.get("BLUEMESH_SELFTEST_DM_DELAY", "15")), try_dm)
+        for spec in filter(None, os.environ.get("BLUEMESH_SHOTS", "").split(";")):
             # "seconds|conversation-nick-or-public|path"
             secs, conv, path = spec.split("|")
 
@@ -1048,7 +1062,7 @@ class BitchatApp(Adw.Application):
                 GLib.timeout_add(700, lambda: (self.win.save_screenshot(path), False)[1])
                 return False
             GLib.timeout_add_seconds(int(secs), shot)
-        fav = os.environ.get("BITCHAT_DESKTOP_SELFTEST_FAV")
+        fav = os.environ.get("BLUEMESH_SELFTEST_FAV")
         if fav:
             # "seconds|nick": open that private chat and click the header star
             secs, _, nick = fav.partition("|")
@@ -1062,13 +1076,13 @@ class BitchatApp(Adw.Application):
                 self.win.fav_btn.emit("clicked")
                 return False
             GLib.timeout_add_seconds(int(secs), try_fav)
-        rc = os.environ.get("BITCHAT_DESKTOP_SELFTEST_RECONNECT")
+        rc = os.environ.get("BLUEMESH_SELFTEST_RECONNECT")
         if rc:
             GLib.timeout_add_seconds(int(rc), lambda: (self.win.restart_backend(), False)[1])
-        test = os.environ.get("BITCHAT_DESKTOP_SELFTEST")
+        test = os.environ.get("BLUEMESH_SELFTEST")
         if test:
             def try_send():
-                need = os.environ.get("BITCHAT_DESKTOP_SELFTEST_WAITFOR")
+                need = os.environ.get("BLUEMESH_SELFTEST_WAITFOR")
                 ready = any(p.get("nickname") == need for p in self.win.peers.values()) if need else bool(self.win.peers)
                 if self.win.conn_state == "on" and ready:
                     self.win.entry.set_text(test)
@@ -1080,18 +1094,18 @@ class BitchatApp(Adw.Application):
     def desktop_notify(self, title, body):
         if not self.notifier:
             return
-        hints = {"desktop-entry": GLib.Variant("s", "bitchat-desktop"),
+        hints = {"desktop-entry": GLib.Variant("s", "bluemesh"),
                  "category": GLib.Variant("s", "im.received")}
         try:
             self.notifier.call("Notify", GLib.Variant("(susssasa{sv}i)", (
-                "BitChat", 0, "bitchat-desktop", title, body[:300], [], hints, -1)),
+                APP_NAME, 0, "bluemesh", title, body[:300], [], hints, -1)),
                 Gio.DBusCallFlags.NONE, -1, None, None, None)
         except Exception as e:
             print("notify failed:", e, file=sys.stderr)
 
 
 def main():
-    return BitchatApp().run(sys.argv)
+    return BlueMeshApp().run(sys.argv)
 
 
 if __name__ == "__main__":
