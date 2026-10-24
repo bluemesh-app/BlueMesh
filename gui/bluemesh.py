@@ -113,6 +113,7 @@ APP_ID = "app.bluemesh.BlueMesh"
 APP_NAME = "BlueMesh"
 VERSION = "0.1.0"
 PUBLIC = "public"
+MAX_FILE_BYTES = 1024 * 1024   # mesh file-transfer limit (bluemeshd enforces it too)
 
 CSS = """
 .bubble { padding: 7px 11px; border-radius: 14px; }
@@ -135,6 +136,8 @@ CSS = """
           padding: 0 6px; font-size: 0.8em; font-weight: bold; min-width: 10px; }
 .composer { padding: 8px; }
 .empty-hint { opacity: 0.6; }
+.file-name { font-weight: bold; }
+.file-actions button { padding: 2px 8px; min-height: 24px; }
 """
 
 SENDER_COLOURS = ["#3584e4", "#2ec27e", "#e66100", "#9141ac", "#c64600",
@@ -154,6 +157,18 @@ def hhmm(ts):
     if lt.tm_yday != today.tm_yday or lt.tm_year != today.tm_year:
         return time.strftime("%d %b %H:%M", lt)
     return time.strftime("%H:%M", lt)
+
+
+def human_size(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KiB"
+    return f"{n / (1024 * 1024):.2f} MiB"
 
 
 def find_backend():
@@ -241,6 +256,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append("Change nickname…", "win.nick")
         menu.append("Join location channel…", "win.join")
+        menu.append("Send file to everyone nearby…", "win.sendfile")
         menu.append("Reconnect", "win.reconnect")
         menu.append("About BlueMesh", "win.about")
         mb = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
@@ -331,6 +347,11 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         body.append(self.msg_scroll)
 
         composer = Gtk.Box(spacing=8, css_classes=["composer"])
+        self.attach_btn = Gtk.Button(icon_name="mail-attachment-symbolic", css_classes=["flat", "circular"],
+                                     valign=Gtk.Align.CENTER,
+                                     tooltip_text="Send a file to everyone nearby (up to 1 MiB, not encrypted)")
+        self.attach_btn.connect("clicked", lambda *_: self.choose_file())
+        composer.append(self.attach_btn)
         self.entry = Gtk.Entry(hexpand=True, placeholder_text="Message everyone nearby…")
         self.entry.connect("activate", lambda *_: self.send_current())
         self.send_btn = Gtk.Button(icon_name="paper-plane-symbolic", tooltip_text="Send (Enter)",
@@ -350,7 +371,8 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         self._add_sidebar_row(self.rooms_list, PUBLIC, "Public", "Everyone nearby", "user-available-symbolic")
 
         for name, cb in (("nick", lambda *_: self.ask_nick()), ("join", lambda *_: self.ask_join()),
-                         ("reconnect", lambda *_: self.restart_backend()), ("about", lambda *_: self.about())):
+                         ("reconnect", lambda *_: self.restart_backend()), ("about", lambda *_: self.about()),
+                         ("sendfile", lambda *_: self.choose_file(switch=True))):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
             self.add_action(a)
@@ -446,6 +468,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         self.conv_title.set_title(c.title)
         self.content_page.set_title(c.title)
         self.leave_btn.set_visible(c.kind == "channel")
+        self.attach_btn.set_visible(c.kind == "public")
         self._update_fav_header()
         if c.kind == "public":
             n = sum(1 for p in self.peers.values() if not p.get("offline"))
@@ -542,6 +565,63 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         if key == self.current:
             self._scroll_bottom()
         return bubble, st
+
+    def add_file_row(self, key, sender, name, size, ts, path=None, mine=False, status=None):
+        """A chat bubble for a file: name + size, and for received files
+        Open / Show in folder buttons. Nothing is ever opened automatically."""
+        bubble, st = self.add_message(key, sender, f"📎 {name}", ts, mine=mine, status=status)
+        body = bubble.get_first_child()
+        body.add_css_class("file-name")
+        info = Gtk.Label(label=human_size(size) + ("" if mine else " · saved to received files"),
+                         xalign=0, css_classes=["meta"])
+        bubble.insert_child_after(info, body)
+        if path and not mine:
+            row = Gtk.Box(spacing=6, css_classes=["file-actions"], margin_top=2)
+            ob = Gtk.Button(label="Open", tooltip_text=f"Open {name} with its default app")
+            ob.connect("clicked", lambda *_: self.open_file(path))
+            fb = Gtk.Button(label="Show in folder", tooltip_text=path)
+            fb.connect("clicked", lambda *_: self.reveal_file(path))
+            row.append(ob)
+            row.append(fb)
+            bubble.insert_child_after(row, info)
+        return bubble, st
+
+    def open_file(self, path):
+        if not os.path.isfile(path):
+            self.toast("That file is no longer there")
+            return
+        f = Gio.File.new_for_path(path)
+        if hasattr(Gtk, "FileLauncher"):
+            Gtk.FileLauncher.new(f).launch(self, None, self._launch_done)
+        else:
+            try:
+                Gio.AppInfo.launch_default_for_uri(f.get_uri(), None)
+            except GLib.Error as e:
+                self.toast(f"Couldn't open it: {e.message}")
+
+    def reveal_file(self, path):
+        f = Gio.File.new_for_path(path)
+        if hasattr(Gtk, "FileLauncher") and os.path.exists(path):
+            Gtk.FileLauncher.new(f).open_containing_folder(self, None, self._reveal_done)
+        else:
+            try:
+                Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(os.path.dirname(path)).get_uri(), None)
+            except GLib.Error as e:
+                self.toast(f"Couldn't open the folder: {e.message}")
+
+    def _launch_done(self, launcher, res):
+        try:
+            launcher.launch_finish(res)
+        except GLib.Error as e:
+            if "dismiss" not in (e.message or "").lower():
+                self.toast(f"Couldn't open it: {e.message}")
+
+    def _reveal_done(self, launcher, res):
+        try:
+            launcher.open_containing_folder_finish(res)
+        except GLib.Error as e:
+            if "dismiss" not in (e.message or "").lower():
+                self.toast(f"Couldn't open the folder: {e.message}")
 
     def bump_unread(self, key):
         if key == self.current and self.is_active():
@@ -677,6 +757,21 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             self._maybe_mark_read()
         elif kind == "sent":
             self._on_sent(ev)
+        elif kind == "file_sending":
+            w = self.pending.get(ev.get("req"))
+            if w and w[1]:
+                w[1].set_label(f"Sending {ev.get('parts', 0)} fragments…")
+        elif kind == "file":
+            sender = ev.get("sender", "?")
+            name = ev.get("name", "file")
+            if ev.get("path"):
+                self.add_file_row(PUBLIC, sender, name, ev.get("size", 0), ev.get("ts", time.time()),
+                                  path=ev.get("path"))
+            else:
+                self.add_system(PUBLIC, f"{sender} sent {name} ({human_size(ev.get('size', 0))}) "
+                                        f"but it couldn't be saved: {ev.get('error', 'unknown error')}")
+            self.bump_unread(PUBLIC)
+            self.notify(f"{sender} (Public)", f"Sent a file: {name}", PUBLIC)
         elif kind == "delivery":
             lab = self.by_msgid.get(ev.get("message_id"))
             if lab:
@@ -766,7 +861,10 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             st.set_label("Not sent — " + ev.get("error", "error"))
             return
         k = ev.get("kind")
-        if k == "public":
+        if k == "file":
+            n = ev.get("links", 0)
+            st.set_label(f"Sent ✓ ({n} link{'s' if n != 1 else ''})")
+        elif k == "public":
             n = ev.get("links", 0)
             st.set_label(f"Sent ✓ ({n} link{'s' if n != 1 else ''})")
         elif k == "channel":
@@ -882,6 +980,59 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         if self.send_cmd(cmd):
             self.entry.set_text("")
         else:
+            bubble.add_css_class("failed")
+            st.set_label("Not sent")
+            self.pending.pop(req, None)
+
+    def choose_file(self, switch=False):
+        if self.current != PUBLIC:
+            if not switch:
+                return
+            self.select_conv(PUBLIC)
+            self.toast("Files go to everyone nearby in Public")
+        title = "Send a file to everyone nearby"
+        if hasattr(Gtk, "FileDialog"):
+            dlg = Gtk.FileDialog(title=title, modal=True, accept_label="Send")
+            dlg.open(self, None, self._file_chosen)
+        else:
+            dlg = Gtk.FileChooserNative(title=title, transient_for=self, modal=True,
+                                        action=Gtk.FileChooserAction.OPEN, accept_label="Send")
+            def resp(d, r):
+                if r == Gtk.ResponseType.ACCEPT and d.get_file():
+                    self.send_file(d.get_file().get_path())
+                d.destroy()
+            dlg.connect("response", resp)
+            self._chooser = dlg  # keep a reference while it is open
+            dlg.show()
+
+    def _file_chosen(self, dlg, res):
+        try:
+            f = dlg.open_finish(res)
+        except GLib.Error:
+            return  # cancelled
+        if f and f.get_path():
+            self.send_file(f.get_path())
+        elif f:
+            self.toast("Only local files can be sent")
+
+    def send_file(self, path):
+        name = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            self.toast(f"Couldn't read {name}: {e.strerror}")
+            return
+        if size > MAX_FILE_BYTES:
+            self.toast(f"{name} is {human_size(size)} — mesh files are limited to 1 MiB")
+            return
+        if size == 0:
+            self.toast(f"{name} is empty")
+            return
+        self.req_seq += 1
+        req = self.req_seq
+        bubble, st = self.add_file_row(PUBLIC, self.my_nick, name, size, time.time(), mine=True, status="Sending…")
+        self.pending[req] = (bubble, st)
+        if not self.send_cmd({"cmd": "send_file", "path": path, "req": req}):
             bubble.add_css_class("failed")
             st.set_label("Not sent")
             self.pending.pop(req, None)
@@ -1076,6 +1227,11 @@ class BlueMeshApp(Adw.Application):
                 self.win.fav_btn.emit("clicked")
                 return False
             GLib.timeout_add_seconds(int(secs), try_fav)
+        sf = os.environ.get("BLUEMESH_SELFTEST_FILE")
+        if sf:
+            # "seconds|path": send that file to Public
+            secs, _, fpath = sf.partition("|")
+            GLib.timeout_add_seconds(int(secs), lambda: (self.win.send_file(fpath), False)[1])
         rc = os.environ.get("BLUEMESH_SELFTEST_RECONNECT")
         if rc:
             GLib.timeout_add_seconds(int(rc), lambda: (self.win.restart_backend(), False)[1])

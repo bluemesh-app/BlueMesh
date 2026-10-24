@@ -18,6 +18,11 @@ emit({"ev":"ready","peer_id":"0f1e2d3c4b5a6978","nickname":"You","fingerprint":"
 emit({"ev":"peripheral","ok":True,"text":"Advertising"})
 emit({"ev":"status","state":"connected","links":2,"text":"Linked (fake)"})
 emit({"ev":"peers","peers":plist()})
+if os.environ.get("FAKE_FILE"):
+    # pretend Alice sent us a file (path must already exist)
+    fp = os.environ["FAKE_FILE"]
+    emit({"ev":"file","peer_id":"a1b2c3d4e5f60718","sender":"Alice","name":os.path.basename(fp),"path":fp,
+          "size":os.path.getsize(fp),"mime":"text/plain","kind":"text","ts":int(time.time())})
 for line in sys.stdin:
     log.write(line); log.flush()
     c = json.loads(line)
@@ -26,5 +31,12 @@ for line in sys.stdin:
         p["favorite"] = c["on"]
         emit({"ev":"favorite","peer_id":p["peer_id"],"fingerprint":p["fingerprint"],"on":c["on"],"told_peer":p["encrypted"],"saved":True})
         emit({"ev":"peers","peers":plist()})
+    elif c.get("cmd") == "send_file":
+        size = os.path.getsize(c["path"])
+        emit({"ev":"file_sending","req":c.get("req"),"name":os.path.basename(c["path"]),"size":size,"parts":3})
+        if size > 1024 * 1024:
+            emit({"ev":"sent","req":c.get("req"),"ok":False,"kind":"file","error":"limited to 1 MiB"})
+        else:
+            emit({"ev":"sent","req":c.get("req"),"ok":True,"kind":"file","name":os.path.basename(c["path"]),"size":size,"links":2})
     elif c.get("cmd") == "quit":
         emit({"ev":"bye"}); break
