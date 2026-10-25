@@ -109,7 +109,7 @@ def present_dialog(dlg, parent):
     else:
         dlg.present()
 
-APP_ID = "io.github.bluemesh.BlueMesh"
+APP_ID = "io.github.bluemesh_app.BlueMesh"
 APP_NAME = "BlueMesh"
 VERSION = "0.1.0"
 PUBLIC = "public"

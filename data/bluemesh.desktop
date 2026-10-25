@@ -9,5 +9,5 @@ Terminal=false
 Categories=Network;Chat;InstantMessaging;GTK;
 Keywords=bluemesh;bluetooth;mesh;chat;offline;
 StartupNotify=true
-StartupWMClass=io.github.bluemesh.BlueMesh
+StartupWMClass=io.github.bluemesh_app.BlueMesh
 X-GNOME-UsesNotifications=true

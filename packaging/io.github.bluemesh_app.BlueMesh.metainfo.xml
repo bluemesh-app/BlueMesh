@@ -2,17 +2,16 @@
 <!--
   AppStream metadata skeleton for BlueMesh.
 
-  TODO(Dyl): before any Flathub submission, replace the placeholder app id
-  io.github.bluemesh.BlueMesh with the real id derived from the project's
-  GitHub account (for example io.github.<account>.BlueMesh), and rename this
-  file, the desktop file, the Flatpak manifest and the installed icon to match.
+  App id io.github.bluemesh_app.BlueMesh matches the GitHub account
+  bluemesh-app (https://github.com/bluemesh-app/BlueMesh); Flathub maps the
+  hyphen to an underscore.
 
-  TODO: replace the placeholder homepage/bugtracker/donation URLs below.
+  TODO: replace the placeholder donation URL below.
   The donation URL is deliberately an example.org placeholder. Do not put a
   live Polar/Lemon checkout URL here until Dyl supplies one.
 -->
 <component type="desktop-application">
-  <id>io.github.bluemesh.BlueMesh</id>
+  <id>io.github.bluemesh_app.BlueMesh</id>
   <name>BlueMesh</name>
   <summary>Off-grid Bluetooth mesh chat for nearby devices</summary>
 
@@ -40,7 +39,7 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">io.github.bluemesh.BlueMesh.desktop</launchable>
+  <launchable type="desktop-id">io.github.bluemesh_app.BlueMesh.desktop</launchable>
 
   <!-- TODO: replace with the real project GitHub URLs. -->
   <url type="homepage">https://github.com/bluemesh-app/BlueMesh</url>
@@ -49,7 +48,7 @@
   <!-- TODO(Dyl): replace this clear placeholder with the real tip URL. -->
   <url type="donation">https://example.org/TODO-tip-url</url>
 
-  <developer id="io.github.bluemesh">
+  <developer id="io.github.bluemesh_app">
     <name>BlueMesh contributors</name>
   </developer>
 

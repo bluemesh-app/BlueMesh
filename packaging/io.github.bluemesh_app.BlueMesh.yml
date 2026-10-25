@@ -1,28 +1,26 @@
 # Flatpak manifest skeleton for BlueMesh. NOT submitted to Flathub.
 #
 # TODO(Dyl) before a real build/submission:
-#   1. Replace the placeholder app id io.github.bluemesh.BlueMesh (here, in the
-#      metainfo/desktop filenames, wrapper name and installed icon paths) with
-#      the real id derived from the project's GitHub account.
-#   2. Replace the placeholder URLs in the metainfo file, including the
-#      example.org tip URL. Do not use a live Polar/Lemon checkout yet.
-#   3. Replace the local "dir" source below with a pinned git source (URL,
+#   1. Replace the example.org tip URL in the metainfo file. Do not use a
+#      live Polar/Lemon checkout yet.
+#   2. Replace the local "dir" source below with a pinned git source (URL,
 #      tag and commit) once the release tag exists.
 #
-# Done: gui/bluemesh.py APP_ID and the desktop StartupWMClass now use
-# io.github.bluemesh.BlueMesh. The crate sources are generated in
+# Done: app id is io.github.bluemesh_app.BlueMesh (GitHub account
+# bluemesh-app) everywhere, including gui/bluemesh.py APP_ID and the desktop
+# StartupWMClass. The crate sources are generated in
 # packaging/cargo-sources.json and included below.
 #
 # Runtime note: org.gnome.Platform already provides Python 3, PyGObject,
 # GTK 4 and libadwaita; the GUI needs no vendored Python packages.
 
-id: io.github.bluemesh.BlueMesh
+id: io.github.bluemesh_app.BlueMesh
 runtime: org.gnome.Platform
 runtime-version: '51'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: io.github.bluemesh.BlueMesh
+command: io.github.bluemesh_app.BlueMesh
 
 finish-args:
   # Nostr location channels, and Bluetooth also needs network access in Flatpak.
@@ -52,23 +50,23 @@ modules:
     build-commands:
       - cargo build --release --locked --offline --manifest-path backend/Cargo.toml --bin bluemeshd
       - install -Dm755 backend/target/release/bluemeshd /app/bin/bluemeshd
-      - install -Dm755 packaging/io.github.bluemesh.BlueMesh.sh /app/bin/io.github.bluemesh.BlueMesh
+      - install -Dm755 packaging/io.github.bluemesh_app.BlueMesh.sh /app/bin/io.github.bluemesh_app.BlueMesh
       - install -Dm644 gui/bluemesh.py /app/lib/bluemesh/bluemesh.py
 
-      - install -Dm644 packaging/io.github.bluemesh.BlueMesh.desktop /app/share/applications/io.github.bluemesh.BlueMesh.desktop
-      - install -Dm644 packaging/io.github.bluemesh.BlueMesh.metainfo.xml /app/share/metainfo/io.github.bluemesh.BlueMesh.metainfo.xml
+      - install -Dm644 packaging/io.github.bluemesh_app.BlueMesh.desktop /app/share/applications/io.github.bluemesh_app.BlueMesh.desktop
+      - install -Dm644 packaging/io.github.bluemesh_app.BlueMesh.metainfo.xml /app/share/metainfo/io.github.bluemesh_app.BlueMesh.metainfo.xml
 
       # App icon: PNGs in data/icons/bluemesh-<size>.png (made from the logo in
       # data/icons/bluemesh-logo-source.png). Installed under the app id, plus a
       # "bluemesh" alias for anything still using the old icon name.
       - |
         for s in 32 48 64 128 256 512; do
-          install -Dm644 data/icons/bluemesh-$s.png /app/share/icons/hicolor/${s}x${s}/apps/io.github.bluemesh.BlueMesh.png
+          install -Dm644 data/icons/bluemesh-$s.png /app/share/icons/hicolor/${s}x${s}/apps/io.github.bluemesh_app.BlueMesh.png
           install -Dm644 data/icons/bluemesh-$s.png /app/share/icons/hicolor/${s}x${s}/apps/bluemesh.png
         done
 
-      - install -Dm644 LICENSE /app/share/licenses/io.github.bluemesh.BlueMesh/LICENSE
-      - install -Dm644 backend/LICENSE /app/share/licenses/io.github.bluemesh.BlueMesh/LICENSE.bitmancer
+      - install -Dm644 LICENSE /app/share/licenses/io.github.bluemesh_app.BlueMesh/LICENSE
+      - install -Dm644 backend/LICENSE /app/share/licenses/io.github.bluemesh_app.BlueMesh/LICENSE.bitmancer
 
     sources:
       # TODO(Flathub): replace this local directory with an immutable git source:
