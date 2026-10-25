@@ -43,8 +43,8 @@
   <launchable type="desktop-id">io.github.bluemesh.BlueMesh.desktop</launchable>
 
   <!-- TODO: replace with the real project GitHub URLs. -->
-  <url type="homepage">https://github.com/YOUR-GITHUB-ACCOUNT/BlueMesh</url>
-  <url type="bugtracker">https://github.com/YOUR-GITHUB-ACCOUNT/BlueMesh/issues</url>
+  <url type="homepage">https://github.com/bluemesh-app/BlueMesh</url>
+  <url type="bugtracker">https://github.com/bluemesh-app/BlueMesh/issues</url>
 
   <!-- TODO(Dyl): replace this clear placeholder with the real tip URL. -->
   <url type="donation">https://example.org/TODO-tip-url</url>
