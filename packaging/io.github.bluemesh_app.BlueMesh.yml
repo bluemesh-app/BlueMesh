@@ -69,5 +69,6 @@ modules:
       - type: git
         url: https://github.com/bluemesh-app/BlueMesh.git
         tag: v0.1.0
+        commit: 9408a2f39dbcdf205f2d2b1851a5506f486fb2a9
 
       - cargo-sources.json
