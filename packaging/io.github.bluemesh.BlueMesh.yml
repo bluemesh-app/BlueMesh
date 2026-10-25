@@ -58,11 +58,14 @@ modules:
       - install -Dm644 packaging/io.github.bluemesh.BlueMesh.desktop /app/share/applications/io.github.bluemesh.BlueMesh.desktop
       - install -Dm644 packaging/io.github.bluemesh.BlueMesh.metainfo.xml /app/share/metainfo/io.github.bluemesh.BlueMesh.metainfo.xml
 
-      # The existing icon source is data/bluemesh.svg; install it under the app
-      # id and keep a "bluemesh" alias because the GUI still uses the icon name
-      # "bluemesh".
-      - install -Dm644 data/bluemesh.svg /app/share/icons/hicolor/scalable/apps/io.github.bluemesh.BlueMesh.svg
-      - install -Dm644 data/bluemesh.svg /app/share/icons/hicolor/scalable/apps/bluemesh.svg
+      # App icon: PNGs in data/icons/bluemesh-<size>.png (made from the logo in
+      # data/icons/bluemesh-logo-source.png). Installed under the app id, plus a
+      # "bluemesh" alias for anything still using the old icon name.
+      - |
+        for s in 32 48 64 128 256 512; do
+          install -Dm644 data/icons/bluemesh-$s.png /app/share/icons/hicolor/${s}x${s}/apps/io.github.bluemesh.BlueMesh.png
+          install -Dm644 data/icons/bluemesh-$s.png /app/share/icons/hicolor/${s}x${s}/apps/bluemesh.png
+        done
 
       - install -Dm644 LICENSE /app/share/licenses/io.github.bluemesh.BlueMesh/LICENSE
       - install -Dm644 backend/LICENSE /app/share/licenses/io.github.bluemesh.BlueMesh/LICENSE.bitmancer

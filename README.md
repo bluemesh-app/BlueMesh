@@ -78,7 +78,7 @@ July 2025. BlueMesh doesn't offer them. Use encrypted direct messages instead.
 * `backend/` – the radio stack, a fork of bitmancer (MIT). Adds `src/bin/bluemeshd/`,
   a headless node that speaks line-delimited JSON on stdin/stdout, plus a BlueZ
   GATT-server/advertising role (`peripheral.rs`) so other devices can connect to it.
-* `data/` – desktop entry and icon.
+* `data/` – desktop entry and app icon (`data/icons/`, BlueMesh logo PNGs).
 * `install.sh` – per-user install into `~/.local` (no root needed).
 * `tests/fake_backend.py` – stand-in backend for GUI tests (no Bluetooth).
 

@@ -15,12 +15,13 @@ account.
 | `io.github.bluemesh.BlueMesh.desktop` | Desktop entry whose filename matches the app id. |
 | `io.github.bluemesh.BlueMesh.sh` | Installed to `/app/bin/io.github.bluemesh.BlueMesh`; launches the GTK GUI and points it at `/app/bin/bluemeshd`. |
 
-`data/bluemesh.svg` is **not renamed**. The manifest installs it as both
-`/app/share/icons/hicolor/scalable/apps/io.github.bluemesh.BlueMesh.svg` (the
-AppStream/Flatpak name) and a `bluemesh.svg` alias for the GUI's current
-hard-coded icon name. If the source icon is renamed later, update those two
-install lines and `Icon=` in the desktop file. The per-user `install.sh` still
-uses `bluemesh.svg` and is unaffected.
+The app icon is the BlueMesh logo, stored as PNGs in `data/icons/`
+(`bluemesh-32.png` … `bluemesh-512.png`, made from
+`data/icons/bluemesh-logo-source.png`). The manifest installs each size as
+`/app/share/icons/hicolor/<size>x<size>/apps/io.github.bluemesh.BlueMesh.png`
+plus a `bluemesh.png` alias. If the app id changes, update those install lines
+and `Icon=` in the desktop file. The per-user `install.sh` installs the same
+PNGs as `bluemesh.png`.
 
 ## Remaining TODOs before a real build / Flathub submission
 
