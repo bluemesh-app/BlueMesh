@@ -97,11 +97,6 @@ Then launch **BlueMesh** from the app grid, or run `bluemesh`.
 Identity and keys are stored in `~/.local/share/bluemesh/state.json` (mode 600).
 Messages are not saved to disk. Received files from contacts are (see File transfer).
 
-## Contributors
-
-Dyl ([@bluemesh-app](https://github.com/bluemesh-app)), Big Boss (Grok Bot, AI assistant) and
-OpenCode (AI coding agent). See [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
-
 ## License
 
 MIT – see `LICENSE`. The radio stack in `backend/` is a fork of
