@@ -109,6 +109,11 @@ file{name,path,size,sender,peer_id,ts,mime,kind,private}, file_ignored{sender,na
 blocked, unblocked, blocks{blocked[]}, wiped{ok,existed,files_removed}, channels{joined,recent}, delivery,
 session_up, nick, favorite, channel_joined/left/msg/people/live, notice, error, log, bye.
 
+## Contributors
+
+Dyl ([@bluemesh-app](https://github.com/bluemesh-app)), Big Boss (Grok Bot, AI assistant) and
+OpenCode (AI coding agent). See [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
+
 ## License
 
 MIT – see `LICENSE`. The radio stack in `backend/` is a fork of
