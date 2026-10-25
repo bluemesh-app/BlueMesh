@@ -97,18 +97,6 @@ Then launch **BlueMesh** from the app grid, or run `bluemesh`.
 Identity and keys are stored in `~/.local/share/bluemesh/state.json` (mode 600).
 Messages are not saved to disk. Received files from contacts are (see File transfer).
 
-## Backend protocol
-
-Commands (stdin): send{text} · dm{peer_id,text} · read{peer_id,ids} · nick{name} ·
-join{channel} · leave{channel} · channel_send{channel,text} · favorite{peer_id,on} ·
-send_file{path,peer_id} · block{peer} · unblock{peer} · blocks · wipe{confirm,files} ·
-channels · peers · quit.
-Events (stdout): ready, status, peripheral, peers, peer_joined/left, public, dm, sent
-(kind public/dm/channel/file), file_sending{name,size,parts},
-file{name,path,size,sender,peer_id,ts,mime,kind,private}, file_ignored{sender,name,private},
-blocked, unblocked, blocks{blocked[]}, wiped{ok,existed,files_removed}, channels{joined,recent}, delivery,
-session_up, nick, favorite, channel_joined/left/msg/people/live, notice, error, log, bye.
-
 ## Contributors
 
 Dyl ([@bluemesh-app](https://github.com/bluemesh-app)), Big Boss (Grok Bot, AI assistant) and
