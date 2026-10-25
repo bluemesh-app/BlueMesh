@@ -89,34 +89,39 @@ and a Rust toolchain to build the backend.
 
 ## Build and install
 
-### Option 1: Flatpak (no Rust needed)
+### 1. Get the code
 
-Install Flatpak and flatpak-builder (e.g. `sudo apt install flatpak flatpak-builder`), then:
+    git clone https://github.com/bluemesh-app/BlueMesh.git && cd BlueMesh
+
+Every command below runs from this `BlueMesh` folder (the repo root), not your
+home directory. To pin the release, run `git checkout v0.1.0`.
+
+### 2. Flatpak (recommended, no Rust needed)
+
+Needs `flatpak` and `flatpak-builder` (e.g. `sudo apt install flatpak flatpak-builder`),
+the Flathub remote, the GNOME SDK and the rust-stable SDK extension (the last
+two are fetched automatically by `--install-deps-from=flathub`):
 
     flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-    git clone https://github.com/bluemesh-app/BlueMesh.git
-    cd BlueMesh
     flatpak-builder --user --install --install-deps-from=flathub --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
+    flatpak run io.github.bluemesh_app.BlueMesh
 
-The Rust toolchain is pulled in by Flatpak automatically. See `packaging/FLATPAK.md`.
+More detail: [`packaging/FLATPAK.md`](packaging/FLATPAK.md).
 
-### Option 2: From source
+### 3. From source (optional)
 
-Needs git, Python 3 with PyGObject/GTK 4, BlueZ, and Rust. If `cargo` is not
-found, install Rust with [rustup](https://rustup.rs/):
+Needs Python 3 with PyGObject, GTK 4, libadwaita and BlueZ, plus Rust.
+If `cargo: command not found`, install Rust with [rustup](https://rustup.rs/) first:
 
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
     . "$HOME/.cargo/env"
 
-Then:
+Then, from the repo root (`BlueMesh/`):
 
-    git clone https://github.com/bluemesh-app/BlueMesh.git
-    cd BlueMesh
-    (cd backend && cargo build --release --bin bluemeshd)
+    cd backend && cargo build --release --bin bluemeshd && cd ..
     ./install.sh
 
-Run these from the `BlueMesh` folder created by `git clone`, not from your home
-directory. To pin the release, run `git checkout v0.1.0` after `cd BlueMesh`.
+`install.sh` lives in the repo root, not in `backend/`.
 
 Then launch **BlueMesh** from the app grid, or run `bluemesh`.
 
