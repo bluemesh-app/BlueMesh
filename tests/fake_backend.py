@@ -2,6 +2,9 @@
 """Stand-in for bluemeshd for GUI tests: no Bluetooth, no network.
 Logs every command it gets to $FAKE_LOG and answers 'favorite' like the real one."""
 import json, os, sys, threading, time
+# Mirrors bitmancer::mesh::PRIVATE_FILE_MAX_BYTES: 256 * 213 = 54,528 bytes of
+# reassembled packet, less 69 framing + 255 name + 16 MIME = 54,188 content.
+MAX_PRIVATE_FILE_BYTES = 54_188
 log = open(os.environ.get("FAKE_LOG", "/tmp/fake_backend.log"), "a")
 def emit(o): print(json.dumps(o), flush=True)
 peers = {
@@ -14,7 +17,7 @@ peers = {
 }
 def plist():
     return sorted(peers.values(), key=lambda p: (not p["favorite"], p["nickname"].lower()))
-emit({"ev":"ready","peer_id":"0f1e2d3c4b5a6978","nickname":"You","fingerprint":"d5"*32,"nickname_set":True,"state_file":"/tmp/x"})
+emit({"ev":"ready","peer_id":"0f1e2d3c4b5a6978","nickname":"You","fingerprint":"d5"*32,"nickname_set":True,"state_file":"/tmp/x","max_private_file_bytes":MAX_PRIVATE_FILE_BYTES})
 emit({"ev":"peripheral","ok":True,"text":"Advertising"})
 emit({"ev":"status","state":"connected","links":2,"text":"Linked (fake)"})
 emit({"ev":"peers","peers":plist()})
@@ -47,8 +50,10 @@ for line in sys.stdin:
         emit({"ev":"file_sending","req":c.get("req"),"name":os.path.basename(c["path"]),"size":size,"parts":3})
         if not c.get("peer_id"):
             emit({"ev":"sent","req":c.get("req"),"ok":False,"kind":"file","error":"broadcast off"})
-        elif size > 1024 * 1024:
-            emit({"ev":"sent","req":c.get("req"),"ok":False,"kind":"file","error":"limited to 1 MiB"})
+        elif size > MAX_PRIVATE_FILE_BYTES:
+            emit({"ev":"sent","req":c.get("req"),"ok":False,"kind":"file",
+                  "error":f"private file transfers are limited to {MAX_PRIVATE_FILE_BYTES:,} bytes "
+                          f"= {MAX_PRIVATE_FILE_BYTES / 1024:.1f} KiB including the file name and type"})
         else:
             emit({"ev":"sent","req":c.get("req"),"ok":True,"kind":"file","name":os.path.basename(c["path"]),"size":size,"links":2})
     elif c.get("cmd") == "block":

@@ -109,11 +109,19 @@ def present_dialog(dlg, parent):
     else:
         dlg.present()
 
-APP_ID = "app.bluemesh.BlueMesh"
+APP_ID = "io.github.bluemesh.BlueMesh"
 APP_NAME = "BlueMesh"
 VERSION = "0.1.0"
 PUBLIC = "public"
-MAX_FILE_BYTES = 1024 * 1024   # absolute mesh file limit (bluemeshd enforces it too)
+# Mirrors bitmancer::mesh::PRIVATE_FILE_MAX_BYTES: Android's 256-fragment
+# budget less the worst-case file name, MIME type and encryption overhead.
+# 256 * 213 = 54,528 bytes of reassembled packet; the worst case spends 340
+# bytes on framing + a 255-byte name + a 16-byte MIME type (69 + 255 + 16),
+# leaving 54,528 - 340 = 54,188 for content. The daemon reports the
+# authoritative value in its ready event; this fallback keeps the advertised
+# limit honest if an older daemon does not.
+MAX_FILE_BYTES = 54188
+MAX_PREVIEW_BYTES = 1024 * 1024   # received files can be larger than private sends
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 SLAP_TEXT = "* {me} slaps {them} around a bit with a large trout 🐟 *"   # same wording as the phone app's /slap
 CHANNEL_LEVELS = [("2", "region (e.g. #r3)"), ("4", "province / state (#r3gx)"), ("5", "city (#r3gx2)"),
@@ -229,6 +237,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         self.my_nick = ""
         self.my_peer_id = ""
         self.nick_set = True
+        self.max_file_bytes = MAX_FILE_BYTES
         self.conn_state = "starting"
         self.links = 0
         self.peers = {}               # peer_id -> dict
@@ -656,7 +665,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             self.toast("That file is no longer there")
             return
         try:
-            if os.path.getsize(path) > MAX_FILE_BYTES:
+            if os.path.getsize(path) > MAX_PREVIEW_BYTES:
                 self.toast("That image is too large to preview")
                 return
             tex = Gdk.Texture.new_from_filename(path)
@@ -812,6 +821,9 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             self.my_nick = ev.get("nickname", "")
             self.my_peer_id = ev.get("peer_id", "")
             self.nick_set = ev.get("nickname_set", True)
+            limit = ev.get("max_private_file_bytes")
+            if isinstance(limit, int) and limit > 0:
+                self.max_file_bytes = limit
             self._update_me()
             if not self.nick_set:
                 GLib.idle_add(lambda: (self.ask_nick(first=True), False)[1])
@@ -1134,7 +1146,7 @@ class BlueMeshWindow(Adw.ApplicationWindow):
             self.toast(problem)
             return
         nick = self.peers.get(pid, {}).get("nickname", "them")
-        title = f"Send a file to {nick}"
+        title = f"Send a file to {nick} (max {self.max_file_bytes / 1024:.1f} KiB)"
         if hasattr(Gtk, "FileDialog"):
             dlg = Gtk.FileDialog(title=title, modal=True, accept_label="Send")
             dlg.open(self, None, lambda d, r: self._file_chosen(d, r, pid))
@@ -1172,8 +1184,9 @@ class BlueMeshWindow(Adw.ApplicationWindow):
         except OSError as e:
             self.toast(f"Couldn't read {name}: {e.strerror}")
             return
-        if size > MAX_FILE_BYTES:
-            self.toast(f"{name} is {human_size(size)}, too big for the mesh")
+        if size > self.max_file_bytes:
+            self.toast(f"{name} is {human_size(size)}; private file transfers are limited to "
+                       f"{self.max_file_bytes / 1024:.1f} KiB ({self.max_file_bytes:,} bytes)")
             return
         if size == 0:
             self.toast(f"{name} is empty")

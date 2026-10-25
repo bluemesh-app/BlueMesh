@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=BlueMesh
+GenericName=Bluetooth Mesh Chat
+Comment=Off-grid chat with nearby devices over Bluetooth mesh
+Exec=io.github.bluemesh.BlueMesh
+Icon=io.github.bluemesh.BlueMesh
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+Keywords=bluemesh;bluetooth;mesh;chat;offline;nostr;
+StartupNotify=true
+StartupWMClass=io.github.bluemesh.BlueMesh
+X-GNOME-UsesNotifications=true

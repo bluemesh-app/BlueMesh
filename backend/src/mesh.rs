@@ -1,0 +1,4996 @@
+// src/mesh.rs
+//
+// The mesh session: local identity, the peer registry, and the inbound packet
+// dispatch. Everything the BLE loop in main.rs needs to behave like a real
+// bitchat peer lives here, so the transport layer stays dumb.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use ed25519_dalek::SigningKey;
+use x25519_dalek::{PublicKey, StaticSecret};
+
+use crate::announce::{self, Announcement};
+use crate::compression;
+use crate::nostr::carrier;
+use crate::favorites::{FavoriteNotice, Favorites};
+use crate::file_packet::FilePacket;
+use crate::fragment::{self, Append, Assembler};
+use crate::noise_payload::{
+    AuthenticatedPeerState, NoisePayload, NoisePayloadType, PrivateMessagePacket, MAX_TLV_VALUE,
+};
+use crate::noise_session::NoiseSessionManager;
+use crate::peer_id::{derive_peer_id, fingerprint, short_display};
+use crate::protocol::{now_millis, peer_id_to_bytes, MessageType, Packet};
+use crate::sync::archive::Archive;
+use crate::sync::rate_limit::ResponseRateLimiter;
+use crate::sync::request::RequestSync;
+use crate::sync::responder;
+
+/// Broadcast TTL. Matches the whitepaper's maximum-reach default.
+const MESSAGE_TTL: u8 = 7;
+/// Android's MAX_FRAGMENTS_PER_ID: a private transfer needing more pieces is
+/// rejected by the phone, so it is refused before it goes on the air.
+pub const PRIVATE_FILE_MAX_FRAGMENTS: usize = 256;
+
+/// What the fragment budget pays for besides the file content and the name and
+/// MIME values themselves.
+///
+/// The 256-fragment limit applies to the reassembled NoiseEncrypted packet,
+/// which `fragment::split` slices into 213-byte pieces. Every byte of that
+/// packet before the content is overhead:
+///
+/// ```text
+///   6   file-name and MIME TLV tag + u16 length (their values are budgeted
+///       separately by PRIVATE_FILE_MAX_NAME_BYTES / ..._MIME_BYTES)
+///   7   file-size TLV: tag + u16 length + u32 size
+///   5   content TLV: tag + u32 length
+///   1   NoisePayloadType byte (0x20)
+///  20   Noise transport: 4-byte nonce prefix + 16-byte AEAD tag
+///  30   v1 outer packet: 14-byte header + 8-byte sender + 8-byte recipient
+/// ```
+///
+/// The outer packet only switches to v2 past a 65,535-byte payload, which is
+/// already beyond this fragment budget, so v1 is the worst case here.
+const PRIVATE_FILE_WIRE_OVERHEAD: usize = 6 + 7 + 5 + 1 + 20 + 14 + 8 + 8;
+/// A Linux file-name component cannot exceed this many bytes.
+const PRIVATE_FILE_MAX_NAME_BYTES: usize = 255;
+/// The longest MIME type `bluemeshd` can produce (`application/json`).
+const PRIVATE_FILE_MAX_MIME_BYTES: usize = 16;
+
+/// The largest file content a private transfer accepts.
+///
+/// This is the phone's fragment budget
+/// (`PRIVATE_FILE_MAX_FRAGMENTS * fragment::SLICE_BYTES` = 54,528) less the
+/// worst-case metadata the same budget has to carry. A file at the limit with
+/// a 255-byte name and a 16-byte MIME type costs 69 + 255 + 16 = 340 bytes on
+/// top of its content, so the file itself can use 54,528 - 340 = 54,188 bytes
+/// and reassembles to exactly 256 fragments. `bluemeshd` reports this value to
+/// the GUI in its `ready` event, and `gui/bluemesh.py` and
+/// `tests/fake_backend.py` carry the same fallback so the advertised limit
+/// cannot drift from the enforced one.
+pub const PRIVATE_FILE_MAX_BYTES: usize = PRIVATE_FILE_MAX_FRAGMENTS
+    * fragment::SLICE_BYTES
+    - PRIVATE_FILE_WIRE_OVERHEAD
+    - PRIVATE_FILE_MAX_NAME_BYTES
+    - PRIVATE_FILE_MAX_MIME_BYTES;
+
+fn private_file_too_big(name: &str, size: usize) -> String {
+    format!(
+        "{name} is too big to send privately ({size} bytes; the private-transfer limit is \
+         {limit} bytes = {limit_kib:.1} KiB including the file name and type)",
+        limit = PRIVATE_FILE_MAX_BYTES,
+        limit_kib = PRIVATE_FILE_MAX_BYTES as f64 / 1024.0,
+    )
+}
+
+/// How often we re-announce. Peers drop a silent link's peer entry after
+/// `blePeerInactivityTimeoutSeconds` (8s), and re-announce on a 15-30s cadence
+/// themselves; 10s keeps us comfortably fresh without spamming the mesh.
+pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Mirrors `bleReachabilityRetentionUnverifiedSeconds` / `...VerifiedSeconds`.
+const PEER_RETENTION: Duration = Duration::from_secs(60);
+
+/// Bound on the replay-dedup set.
+const SEEN_LIMIT: usize = 512;
+
+#[derive(Debug, Clone)]
+// Several variants carry a peer_id the UI does not read yet. It stays because
+// an event without its subject cannot be acted on - blocking a peer from a
+// message they sent, or replying privately to one, both need it.
+#[allow(dead_code)]
+pub enum MeshEvent {
+    PeerAppeared { peer_id: String, nickname: String },
+    /// A frame the mesh layer produced while handling an inbound one, for the
+    /// main loop to put on the air. A handshake is a conversation, so a reply
+    /// has to be able to originate down here rather than from a user action.
+    Send(Vec<u8>),
+    /// A frame for whoever sent the one being handled, and for nobody else.
+    ///
+    /// Carries no address because this layer has none to give: it knows peer
+    /// IDs, not links. The caller already holds the link the frame arrived on,
+    /// and that is the right destination — a gossip sync request is sent with
+    /// no hops left, so its sender is always the peer on the other end of that
+    /// link.
+    Reply(Vec<u8>),
+    /// A peer favourited or unfavourited us, handing over their Nostr address.
+    /// Never rendered as chat: upstream sends this as private-message content
+    /// and intercepts it on arrival, so showing it would print plumbing.
+    FavoriteUpdate {
+        peer_id: String,
+        nickname: String,
+        fingerprint: String,
+        notice: FavoriteNotice,
+    },
+    /// Sealed mail a peer handed us to hold for somebody who is not here.
+    ///
+    /// Opaque: we cannot read it and are not meant to. The tier a depositor
+    /// gets is the caller's decision, because it depends on favourites, which
+    /// are a relationship rather than a protocol fact.
+    CourierDeposit {
+        depositor: String,
+        envelope: Box<crate::courier::Envelope>,
+    },
+    /// Mail addressed to *us*, carried here by somebody.
+    ///
+    /// Recognised by its tag matching one of ours, which is the only way to
+    /// tell a delivery from a deposit — they are the same packet.
+    CourierArrived {
+        courier: String,
+        envelope: Box<crate::courier::Envelope>,
+    },
+    /// A signed Nostr event a peer handed us over Bluetooth, either asking us
+    /// to publish it or passing on what a gateway published.
+    ///
+    /// Surfaced rather than acted on here: whether to carry it depends on relay
+    /// reachability and a user toggle, neither of which the mesh layer can see.
+    /// The signature is deliberately *not* checked yet — the caller does that,
+    /// because the caller is the one that would act on it.
+    CarriedEvent {
+        /// Who handed it to us, so a rate budget can be spent per peer.
+        depositor: String,
+        direction: carrier::Direction,
+        geohash: String,
+        event_json: String,
+    },
+    /// A message we sent has been acknowledged.
+    DeliveryUpdate {
+        message_id: String,
+        status: DeliveryStatus,
+    },
+    /// Decrypted chat from an established session.
+    PrivateMessage {
+        peer_id: String,
+        sender: String,
+        content: String,
+        /// What a read receipt for this message must name.
+        message_id: String,
+    },
+    /// An encrypted channel came up. The fingerprint is what a user compares
+    /// out of band; the peer ID rotates with the key, so it cannot be that.
+    SessionUp {
+        peer_id: String,
+        nickname: String,
+        fingerprint: String,
+    },
+    PeerRenamed { peer_id: String, nickname: String },
+    PeerLeft { peer_id: String, nickname: String },
+    PublicMessage {
+        peer_id: String,
+        sender: String,
+        content: String,
+        timestamp_ms: u64,
+    },
+    /// A file arrived over the mesh itself rather than as a link.
+    FileReceived {
+        peer_id: String,
+        sender: String,
+        name: String,
+        mime: Option<String>,
+        bytes: Vec<u8>,
+        is_image: bool,
+        /// Sent to us alone: either sealed in our Noise session (payload 0x20)
+        /// or a raw fileTransfer addressed to our peer ID. False for a
+        /// broadcast that every device in range received.
+        private: bool,
+    },
+    /// Human-readable diagnostic destined for the message pane.
+    Notice(String),
+    /// Per-frame protocol trace, only emitted while `/debug` is on. Unlike a
+    /// Notice these are never deduplicated.
+    Trace(String),
+}
+
+/// What a `/dm` produced: the frames to put on the air, and the identifier of
+/// each message so a later receipt can be matched to the right line.
+pub struct SentDirectMessages {
+    pub ids: Vec<String>,
+    pub frames: Vec<Vec<u8>>,
+}
+
+/// How far a sent private message has got.
+///
+/// Read outranks delivered: upstream discards a delivery acknowledgement that
+/// arrives for a message already marked read, since the two can race and the
+/// weaker one must not undo the stronger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeliveryStatus {
+    Delivered,
+    Read,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeshPeer {
+    pub peer_id: String,
+    pub nickname: String,
+    /// The announced key this peer's ID and fingerprint were derived from.
+    /// Retained rather than recomputed: verifying a re-announce means checking
+    /// the new key against the one we already accepted.
+    #[allow(dead_code)]
+    pub noise_public_key: Vec<u8>,
+    pub signing_public_key: Vec<u8>,
+    pub fingerprint: String,
+    pub verified: bool,
+    /// What the peer says it can do, or `None` from a client old enough not to
+    /// say. The two are different answers and are kept apart: "advertises
+    /// nothing" is a current peer with everything off.
+    pub capabilities: Option<announce::Capabilities>,
+    /// Peer IDs this peer says it is linked to, from the announce's
+    /// `directNeighbors`. Advisory — a claim, not an observation — and the only
+    /// view we get of the mesh beyond our own radio, since announces are never
+    /// relayed and so only ever reach us from a peer we can already hear.
+    pub claims_neighbors: Vec<String>,
+    pub last_seen: Instant,
+}
+
+impl MeshPeer {
+    /// Whether this peer offers to carry geohash traffic to the internet.
+    pub fn is_gateway(&self) -> bool {
+        self.capabilities
+            .is_some_and(|advertised| advertised.has(announce::Capabilities::GATEWAY))
+    }
+}
+
+/// How far this side has got through the authenticated-peer-state exchange for
+/// one Noise session generation.
+///
+/// `sent` is our initial 0x21, emitted as soon as the handshake completes.
+/// `echoed` is the one additional copy sent after the peer's first valid proof
+/// arrives, which is what converges when the peer ignored our first copy because
+/// its own session was not marked authenticated yet. Both reset when a new
+/// handshake starts, because the next session is a new generation.
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerStateProof {
+    sent: bool,
+    echoed: bool,
+}
+
+pub struct MeshService {
+    pub my_peer_id: String,
+    pub nickname: String,
+    pub peers: HashMap<String, MeshPeer>,
+    pub noise_public_key: [u8; 32],
+    /// Encrypted sessions, one per peer we have spoken to privately. Owns the
+    /// static secret, since the handshake is the only thing that needs it.
+    sessions: NoiseSessionManager,
+    /// Messages typed before the encrypted channel came up, by peer.
+    ///
+    /// Held here rather than in the session manager so the identifier exists
+    /// the moment the user presses enter: the UI echoes the line immediately
+    /// and needs something to match a later receipt against. The manager's own
+    /// queue also discards silently when no session object exists yet.
+    pending_dms: HashMap<String, Vec<PrivateMessagePacket>>,
+    /// Who has handed us a Nostr address, and who we have handed ours to.
+    pub favorites: Favorites,
+    /// Full SHA-256 fingerprints we refuse traffic from. Fingerprints rather
+    /// than peer IDs or nicknames: a nickname is claimed rather than owned, and
+    /// a peer ID follows the key, so blocking either would be blocking a label.
+    blocked: HashSet<String>,
+    signing_key: SigningKey,
+    seen_message_ids: HashSet<String>,
+    seen_order: VecDeque<String>,
+    last_announce: Option<Instant>,
+    /// Whether we are currently offering to carry mesh traffic to the internet.
+    ///
+    /// Set by the client from two things it knows and this layer does not: that
+    /// the user opted in, and that relays are actually answering. Advertising
+    /// `gateway` while either is false is a promise a mesh-only peer will act
+    /// on and we cannot keep.
+    pub gateway_ready: bool,
+    /// Buffers fragmented packets until they are whole.
+    assembler: Assembler,
+    /// Public traffic held so a peer that was away can be caught up.
+    ///
+    /// Only ever fed packets this service has already accepted — a forged
+    /// message we refused to show the user must not be one we hand onward to
+    /// the room on its author's behalf.
+    archive: Archive,
+    /// Bounds how often one peer can make us replay that archive.
+    sync_limiter: ResponseRateLimiter,
+    /// When on, every inbound frame is reported to the UI. Interop bugs are
+    /// otherwise invisible: unknown packet types are silently ignored.
+    pub debug: bool,
+    /// Consecutive undecryptable messages per peer, and when we last
+    /// re-handshook because of them.
+    decrypt_failures: HashMap<String, (u32, Option<Instant>)>,
+    /// When we last sent the opening XX message to each peer.
+    handshake_started: HashMap<String, Instant>,
+    /// Whether this side has sent its initial authenticated-peer-state proof and
+    /// its one echo for the current session generation, by peer.
+    peer_state_proofs: HashMap<String, PeerStateProof>,
+}
+
+impl MeshService {
+    pub fn new(identity_key: [u8; 32], noise_static_key: [u8; 32], nickname: &str) -> Self {
+        let signing_key = SigningKey::from_bytes(&identity_key);
+        let noise_static_key = StaticSecret::from(noise_static_key);
+        let noise_public_key = PublicKey::from(&noise_static_key).to_bytes();
+        let my_peer_id = derive_peer_id(&noise_public_key);
+
+        Self {
+            my_peer_id,
+            nickname: announce::truncate_nickname(nickname),
+            peers: HashMap::new(),
+            noise_public_key,
+            sessions: NoiseSessionManager::new(noise_static_key),
+            pending_dms: HashMap::new(),
+            favorites: Favorites::new(),
+            blocked: HashSet::new(),
+            signing_key,
+            seen_message_ids: HashSet::new(),
+            seen_order: VecDeque::new(),
+            last_announce: None,
+            gateway_ready: false,
+            assembler: Assembler::new(),
+            archive: Archive::new(),
+            sync_limiter: ResponseRateLimiter::default(),
+            debug: false,
+            decrypt_failures: HashMap::new(),
+            handshake_started: HashMap::new(),
+            peer_state_proofs: HashMap::new(),
+        }
+    }
+
+    pub fn my_fingerprint(&self) -> String {
+        fingerprint(&self.noise_public_key)
+    }
+
+    pub fn set_nickname(&mut self, nickname: &str) {
+        self.nickname = announce::truncate_nickname(nickname);
+    }
+
+    fn sender_bytes(&self) -> [u8; 8] {
+        peer_id_to_bytes(&self.my_peer_id)
+    }
+
+    // MARK: - Outbound
+
+    /// Signed TLV announce. This is what makes us a peer: without it we are an
+    /// anonymous subscribed central that nobody lists or addresses.
+    pub fn announce_frame(&mut self) -> Option<Vec<u8>> {
+        // Advertised only while we actually have somewhere to carry traffic to.
+        // A standing claim would be a promise we cannot keep the moment the
+        // relays go away, and a mesh-only peer that trusts it stops trying
+        // anything else.
+        let mut claimed = announce::Capabilities::from_bits(announce::ADVERTISED);
+        if self.gateway_ready {
+            claimed = claimed.with(announce::Capabilities::GATEWAY);
+        }
+        let payload = Announcement::new(
+            &self.nickname,
+            self.noise_public_key.to_vec(),
+            self.signing_key.verifying_key().to_bytes().to_vec(),
+        )
+        .with_capabilities(claimed)
+        .encode()?;
+
+        let mut packet = Packet::new(
+            MessageType::Announce,
+            self.sender_bytes(),
+            payload,
+            MESSAGE_TTL,
+        );
+        if !announce::sign_packet(&mut packet, &self.signing_key) {
+            return None;
+        }
+        self.last_announce = Some(Instant::now());
+        // Our own announce belongs in the archive too. `handle_packet` returns
+        // early on our own peer ID, so the relayed echo never files it, and a
+        // peer syncing from us would get everyone's presence except ours.
+        self.archive_packet(&packet);
+        packet.encode()
+    }
+
+    pub fn announce_due(&self) -> bool {
+        match self.last_announce {
+            None => true,
+            Some(at) => at.elapsed() >= ANNOUNCE_INTERVAL,
+        }
+    }
+
+    /// Signed, empty-payload leave notice (BLEService.stopServices).
+    pub fn leave_frame(&self) -> Option<Vec<u8>> {
+        let mut packet = Packet::new(
+            MessageType::Leave,
+            self.sender_bytes(),
+            Vec::new(),
+            MESSAGE_TTL,
+        );
+        announce::sign_packet(&mut packet, &self.signing_key);
+        packet.encode()
+    }
+
+    /// Public mesh message: type 0x02 whose payload is the raw UTF-8 text.
+    ///
+    /// The receiver *requires* a valid signature ("Dropping public message with
+    /// missing/invalid signature"), and it verifies by re-encoding the packet
+    /// canonically. That re-encode compresses any payload of 100 bytes or more
+    /// with Apple's DEFLATE, which we cannot reproduce byte-for-byte, so long
+    /// text is split into chunks that stay below the threshold. Each chunk is
+    /// its own signed packet.
+    pub fn public_message_frames(&mut self, content: &str) -> Vec<Vec<u8>> {
+        split_for_signing(content)
+            .into_iter()
+            .filter_map(|chunk| {
+                let mut packet = Packet::new(
+                    MessageType::Message,
+                    self.sender_bytes(),
+                    chunk.as_bytes().to_vec(),
+                    MESSAGE_TTL,
+                );
+                if !announce::sign_packet(&mut packet, &self.signing_key) {
+                    return None;
+                }
+                self.remember_packet(&packet, &chunk);
+                // Likewise for what we say: upstream files its own broadcasts
+                // at send time for exactly this reason. Without it a node that
+                // talks seeds none of its own words into the room's history.
+                self.archive_packet(&packet);
+                packet.encode()
+            })
+            .collect()
+    }
+
+    /// An addressed, unsigned frame.
+    ///
+    /// Noise packets carry no Ed25519 signature. The handshake authenticates
+    /// the channel on its own, and signing would not survive the trip anyway:
+    /// verification re-encodes the packet canonically, and that re-encode
+    /// compresses any payload at or above 100 bytes with a DEFLATE we cannot
+    /// reproduce byte-for-byte. Handshake messages are routinely larger than
+    /// that, so a signed Noise frame would be dropped by the receiver every
+    /// time. See NOTES.md on canonical encoding.
+    fn noise_frame(
+        &self,
+        kind: MessageType,
+        recipient: &str,
+        payload: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        Packet::new(kind, self.sender_bytes(), payload, MESSAGE_TTL)
+            .with_recipient(peer_id_to_bytes(recipient))
+            .encode()
+    }
+
+    /// Whether an encrypted channel to this peer is already up.
+    ///
+    /// Named for what it answers rather than for what it calls. This was
+    /// `has_session`, which collided with `NoiseSessionManager::has_session` —
+    /// a different function, on a different type, answering a different
+    /// question: that one is `contains_key`, meaning a session is *registered*,
+    /// where this one means the handshake finished. A grep for callers of
+    /// `has_session` looked answered and pointed at the wrong one, which is how
+    /// five methods nearly got recorded as live when nothing outside tests
+    /// reaches them.
+    pub fn has_encrypted_channel(&self, peer_id: &str) -> bool {
+        self.sessions.has_established_session(peer_id)
+    }
+
+    /// The peer currently answering to a nickname.
+    ///
+    /// Nicknames are chosen, not owned — two peers can claim the same one. When
+    /// they do, refusing is better than silently encrypting to whichever we
+    /// happened to hear from first.
+    pub fn peer_id_for_nickname(&self, nickname: &str) -> Result<String, String> {
+        let matches: Vec<&MeshPeer> = self
+            .peers
+            .values()
+            .filter(|peer| peer.nickname.eq_ignore_ascii_case(nickname))
+            .collect();
+        match matches.as_slice() {
+            [] => Err(format!("nobody here is called {nickname}")),
+            [peer] => Ok(peer.peer_id.clone()),
+            several => Err(format!(
+                "{} peers are called {nickname}; use a peer ID instead ({})",
+                several.len(),
+                several
+                    .iter()
+                    .map(|peer| short_display(&peer.peer_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Resolves a name to something we can address, whether or not the peer is
+    /// in range.
+    ///
+    /// Live peers win, then favourites. Without the second step the internet
+    /// transport is unreachable by design: `/dm bob` would answer "nobody here
+    /// is called bob" for exactly the peer it exists to carry a message to.
+    /// A favourite's fingerprint begins with their peer ID, so the caller gets
+    /// the same kind of value from either source.
+    pub fn addressable_peer_id_for(&self, nickname: &str) -> Result<String, String> {
+        if let Ok(peer_id) = self.peer_id_for_nickname(nickname) {
+            return Ok(peer_id);
+        }
+        match self.favorites.by_nickname(nickname).as_slice() {
+            [] => Err(format!("nobody here is called {nickname}")),
+            [(fingerprint, _)] => Ok(fingerprint.chars().take(16).collect()),
+            several => Err(format!(
+                "{} favourites are called {nickname}; use a peer ID instead ({})",
+                several.len(),
+                several
+                    .iter()
+                    .map(|(fingerprint, _)| short_display(fingerprint))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Builds the card we show someone standing next to us.
+    ///
+    /// Signed here rather than by the caller because this is the only place
+    /// that holds the signing key, and handing it out to be signed elsewhere
+    /// would make every future caller a place the key could leak from.
+    pub fn verification_card(
+        &self,
+        npub: Option<&str>,
+        now: i64,
+        nonce: [u8; crate::verification::NONCE_BYTES],
+    ) -> crate::verification::Card {
+        crate::verification::Card::build(
+            &self.signing_key,
+            &self.noise_public_key,
+            &self.nickname,
+            npub,
+            now,
+            nonce,
+        )
+    }
+
+    /// Records that a fingerprint was checked against a card shown in person.
+    ///
+    /// Distinct from `MeshPeer.verified`, which only says an announce carried a
+    /// signature matching the key inside it. That proves the sender holds the
+    /// key they claim; it says nothing about whose key it is, which is the whole
+    /// question here, and an attacker in the middle passes it effortlessly.
+    pub fn mark_verified(&mut self, fingerprint: &str) {
+        self.sessions.verify_fingerprint(&fingerprint.to_lowercase());
+    }
+
+    /// Whether a peer ID or fingerprint has been verified in person.
+    ///
+    /// Takes either, matching `is_blocked`: the client addresses peers by the
+    /// 16-character peer ID, and a fingerprint begins with it.
+    pub fn is_verified(&self, peer_id_or_fingerprint: &str) -> bool {
+        let needle = peer_id_or_fingerprint.to_lowercase();
+        self.sessions
+            .get_verified_fingerprints()
+            .iter()
+            .any(|fingerprint| fingerprint.starts_with(&needle) || needle.starts_with(fingerprint))
+    }
+
+    pub fn verified_fingerprints(&self) -> HashSet<String> {
+        self.sessions.get_verified_fingerprints()
+    }
+
+    /// Verified peers by name where we know one, by fingerprint prefix where we
+    /// do not — someone verified months ago may not be in range today, and the
+    /// list is worth reading either way.
+    pub fn verified_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .verified_fingerprints()
+            .iter()
+            .map(|fingerprint| {
+                self.peers
+                    .values()
+                    .find(|peer| peer.fingerprint == *fingerprint)
+                    .map(|peer| format!("{} (here now)", peer.nickname))
+                    .unwrap_or_else(|| fingerprint.chars().take(16).collect())
+            })
+            .collect();
+        labels.sort();
+        labels
+    }
+
+    pub fn load_verified(&mut self, fingerprints: HashSet<String>) {
+        self.sessions.load_verified_fingerprints(fingerprints);
+    }
+
+    /// Their long-lived Nostr address, if they ever handed it over.
+    pub fn nostr_address_for(&self, peer_id: &str) -> Option<&str> {
+        self.favorites
+            .resolve(peer_id)
+            .and_then(|(_, entry)| entry.their_nostr_key.as_deref())
+    }
+
+    /// Forgets every peer, session and block.
+    ///
+    /// The static secret cannot be dropped from a live service, so this is not
+    /// the whole of a wipe — the caller is expected to exit immediately
+    /// afterwards, which is what actually releases the key material.
+    pub fn wipe(&mut self) {
+        for peer_id in self.peers.keys().cloned().collect::<Vec<_>>() {
+            self.sessions.remove_session(&peer_id);
+        }
+        self.peers.clear();
+        self.blocked.clear();
+        // Favourites hold peers' Nostr addresses and who was willing to be
+        // reached by us. A wipe that left them would leave a contact list.
+        self.favorites.clear();
+        self.pending_dms.clear();
+        self.seen_message_ids.clear();
+        self.seen_order.clear();
+        // The archive is a record of what the room said within earshot of us,
+        // which is a record of who was here. It goes with everything else.
+        self.archive.clear();
+    }
+
+    /// Whether traffic from this sender is refused.
+    ///
+    /// Takes a peer ID or a full fingerprint. A peer ID is the first 16 hex
+    /// characters of the fingerprint (`derive_peer_id` is `fingerprint`
+    /// truncated), so a prefix match answers both without needing to have seen
+    /// the peer's announce. That reuses the protocol's own assumption that 64
+    /// bits of hash identify a peer — the same assumption peer IDs already
+    /// rest on — rather than introducing a weaker one.
+    pub fn is_blocked(&self, peer_id_or_fingerprint: &str) -> bool {
+        let needle = peer_id_or_fingerprint.to_lowercase();
+        self.blocked
+            .iter()
+            .any(|fingerprint| fingerprint.starts_with(&needle) || needle.starts_with(fingerprint))
+    }
+
+    /// Restores the list persisted in `state.json`.
+    pub fn load_blocked(&mut self, blocked: HashSet<String>) {
+        self.blocked = blocked.into_iter().map(|f| f.to_lowercase()).collect();
+    }
+
+    pub fn blocked_fingerprints(&self) -> HashSet<String> {
+        self.blocked.clone()
+    }
+
+    /// Blocked peers, named where we still remember a nickname for them.
+    pub fn blocked_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .blocked
+            .iter()
+            .map(|fingerprint| {
+                self.peers
+                    .values()
+                    .find(|peer| peer.fingerprint == *fingerprint)
+                    .map(|peer| peer.nickname.clone())
+                    .unwrap_or_else(|| fingerprint.chars().take(16).collect())
+            })
+            .collect();
+        labels.sort();
+        labels
+    }
+
+    /// Blocks a peer we have seen announce.
+    ///
+    /// The fingerprint comes from their announced key, so blocking someone we
+    /// have only ever heard a message from is refused rather than approximated:
+    /// storing a truncated identifier would break the shared `state.json`
+    /// contract, which holds full SHA-256 fingerprints.
+    pub fn block(&mut self, peer_id: &str) -> Result<String, String> {
+        if peer_id == self.my_peer_id {
+            return Err("you cannot block yourself".to_string());
+        }
+        let Some(peer) = self.peers.get(peer_id) else {
+            return Err(format!(
+                "{} has not announced itself yet, so its key is unknown",
+                short_display(peer_id)
+            ));
+        };
+        let (fingerprint, nickname) = (peer.fingerprint.clone(), peer.nickname.clone());
+        if !self.blocked.insert(fingerprint) {
+            return Err(format!("{nickname} is already blocked"));
+        }
+        // Drop the peer and any encrypted channel with them. Leaving either in
+        // place would keep a blocked peer listed and reachable.
+        self.peers.remove(peer_id);
+        self.sessions.remove_session(peer_id);
+        self.reset_peer_state_proof(peer_id);
+        Ok(nickname)
+    }
+
+    /// Unblocks by nickname, peer ID or fingerprint.
+    pub fn unblock(&mut self, needle: &str) -> Result<String, String> {
+        let needle = needle.to_lowercase();
+        // A nickname only resolves while we still remember the peer, so fall
+        // back to matching the stored fingerprint directly.
+        let by_name = self
+            .peers
+            .values()
+            .find(|peer| peer.nickname.eq_ignore_ascii_case(&needle))
+            .map(|peer| peer.fingerprint.clone());
+        let target = by_name.or_else(|| {
+            self.blocked
+                .iter()
+                .find(|fingerprint| fingerprint.starts_with(&needle))
+                .cloned()
+        });
+        match target {
+            Some(fingerprint) if self.blocked.remove(&fingerprint) => {
+                Ok(fingerprint.chars().take(16).collect())
+            }
+            _ => Err(format!("{needle} is not blocked")),
+        }
+    }
+
+    /// Frames carrying a private message.
+    ///
+    /// When no channel is up yet this starts the handshake and queues the text
+    /// instead of dropping it; the queued message goes out by itself once the
+    /// session establishes, so the user never has to send it twice.
+    pub fn dm_frames(
+        &mut self,
+        peer_id: &str,
+        content: &str,
+    ) -> Result<SentDirectMessages, String> {
+        if peer_id == self.my_peer_id {
+            return Err("that is your own peer ID".to_string());
+        }
+        if self.is_blocked(peer_id) {
+            return Err("you have blocked that peer".to_string());
+        }
+        // Identifiers are minted here, before anything is sent, because the UI
+        // echoes the line straight away and a receipt arriving later has to
+        // match something already on screen.
+        let records: Vec<PrivateMessagePacket> = split_into_chunks(content, MAX_TLV_VALUE)
+            .into_iter()
+            .map(|chunk| PrivateMessagePacket::new(&chunk))
+            .collect();
+        let ids: Vec<String> = records.iter().map(|r| r.message_id.clone()).collect();
+
+        if self.sessions.has_established_session(peer_id) {
+            let mut frames = Vec::new();
+            for record in &records {
+                frames.extend(self.sealed_record_frame(peer_id, record)?);
+            }
+            return Ok(SentDirectMessages { ids, frames });
+        }
+
+        // A handshake may already be under way (an earlier message started it
+        // and the peer has not answered yet). Calling initiate_handshake on that
+        // session would try to write the *next* XX message, which needs the
+        // peer's ephemeral key we never got: "Missing keys". So: if it started
+        // only moments ago, queue behind it; otherwise it is stale (the reply
+        // was lost, the link dropped) and we start over from scratch.
+        if self.sessions.has_session(peer_id) {
+            let recent = self
+                .handshake_started
+                .get(peer_id)
+                .map_or(false, |t| t.elapsed() < Duration::from_secs(8));
+            if recent {
+                self.pending_dms
+                    .entry(peer_id.to_string())
+                    .or_default()
+                    .extend(records);
+                return Ok(SentDirectMessages { ids, frames: Vec::new() });
+            }
+            self.sessions.remove_session(peer_id);
+        }
+        self.reset_peer_state_proof(peer_id);
+        let opening = self
+            .sessions
+            .initiate_handshake(peer_id)
+            .map_err(|error| format!("could not start a handshake: {error}"))?;
+        self.handshake_started.insert(peer_id.to_string(), Instant::now());
+        self.pending_dms
+            .entry(peer_id.to_string())
+            .or_default()
+            .extend(records);
+        Ok(SentDirectMessages {
+            ids,
+            frames: self
+                .noise_frame(MessageType::NoiseHandshake, peer_id, opening)
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    /// Wraps one chunk of text as a private-message record, seals it, and
+    /// addresses the frame.
+    fn sealed_record_frame(
+        &mut self,
+        peer_id: &str,
+        record: &PrivateMessagePacket,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let encoded = record
+            .encode()
+            .ok_or_else(|| "message does not fit the wire format".to_string())?;
+        let payload = NoisePayload::new(NoisePayloadType::PrivateMessage, encoded).encode();
+        let sealed = self
+            .sessions
+            .encrypt(&payload, peer_id)
+            .map_err(|error| format!("could not encrypt: {error}"))?;
+        Ok(self
+            .noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
+            .into_iter()
+            .collect())
+    }
+
+    /// Frames telling a peer we favourited them, carrying our Nostr address.
+    ///
+    /// Sent as an ordinary private message because that is what upstream reads:
+    /// there is no separate packet type for this, and inventing one would talk
+    /// to nobody.
+    pub fn favorite_frames(
+        &mut self,
+        peer_id: &str,
+        is_favorite: bool,
+        our_nostr_key: &str,
+    ) -> Result<SentDirectMessages, String> {
+        let fingerprint = self
+            .peers
+            .get(peer_id)
+            .map(|peer| peer.fingerprint.clone())
+            .ok_or_else(|| {
+                format!(
+                    "{} has not announced itself yet, so its key is unknown",
+                    short_display(peer_id)
+                )
+            })?;
+        let nickname = self
+            .peers
+            .get(peer_id)
+            .map(|peer| peer.nickname.clone())
+            .unwrap_or_default();
+
+        let text = Favorites::notice_text(is_favorite, our_nostr_key);
+        let sent = self.dm_frames(peer_id, &text)?;
+        // Record our own half only once the frames exist: a failure above
+        // means nothing was said, and the list should not claim otherwise.
+        self.favorites.set_ours(&fingerprint, &nickname, is_favorite);
+        Ok(sent)
+    }
+
+    /// A sealed receipt naming one message.
+    ///
+    /// Returns `None` rather than an error when there is no session: a receipt
+    /// is not worth opening a channel for, and the peer will resend if it
+    /// cares.
+    fn receipt_frame(
+        &mut self,
+        peer_id: &str,
+        kind: NoisePayloadType,
+        message_id: &str,
+    ) -> Option<Vec<u8>> {
+        if !self.sessions.has_established_session(peer_id) {
+            return None;
+        }
+        let payload = NoisePayload::receipt(kind, message_id).encode();
+        let sealed = self.sessions.encrypt(&payload, peer_id).ok()?;
+        self.noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)
+    }
+
+    /// Frames telling a peer their messages have been read.
+    pub fn read_receipt_frames(&mut self, peer_id: &str, message_ids: &[String]) -> Vec<Vec<u8>> {
+        message_ids
+            .iter()
+            .filter_map(|id| self.receipt_frame(peer_id, NoisePayloadType::ReadReceipt, id))
+            .collect()
+    }
+
+    /// Forgets proof bookkeeping for a peer because the next handshake is a new
+    /// session generation.
+    fn reset_peer_state_proof(&mut self, peer_id: &str) {
+        self.peer_state_proofs.remove(peer_id);
+    }
+
+    /// The state we prove inside a Noise session: the same capability bits the
+    /// announce carries, plus the Ed25519 key that signs our announces.
+    fn our_peer_state(&self) -> AuthenticatedPeerState {
+        let mut capabilities = announce::Capabilities::from_bits(announce::ADVERTISED);
+        if self.gateway_ready {
+            capabilities = capabilities.with(announce::Capabilities::GATEWAY);
+        }
+        AuthenticatedPeerState::new(
+            capabilities,
+            self.signing_key.verifying_key().to_bytes(),
+        )
+    }
+
+    /// Our initial 0x21 for this session generation, sent once.
+    fn peer_state_proof_frame(&mut self, peer_id: &str) -> Option<Vec<u8>> {
+        if self
+            .peer_state_proofs
+            .get(peer_id)
+            .is_some_and(|proof| proof.sent)
+        {
+            return None;
+        }
+        if !self.sessions.has_established_session(peer_id) {
+            return None;
+        }
+        let payload = NoisePayload::new(
+            NoisePayloadType::AuthenticatedPeerState,
+            self.our_peer_state().encode(),
+        )
+        .encode();
+        let sealed = self.sessions.encrypt(&payload, peer_id).ok()?;
+        let frame = self.noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)?;
+        self.peer_state_proofs.entry(peer_id.to_string()).or_default().sent = true;
+        Some(frame)
+    }
+
+    /// One copy of our 0x21 after accepting the peer's first valid proof,
+    /// whether or not our initial proof was already sent. Android discards a
+    /// proof that arrives before its own side is authenticated, so the echo is
+    /// what makes both ends converge; further identical proofs are ignored.
+    fn peer_state_echo_frame(&mut self, peer_id: &str) -> Option<Vec<u8>> {
+        if self
+            .peer_state_proofs
+            .get(peer_id)
+            .is_some_and(|proof| proof.echoed)
+        {
+            return None;
+        }
+        if !self.sessions.has_established_session(peer_id) {
+            return None;
+        }
+        let payload = NoisePayload::new(
+            NoisePayloadType::AuthenticatedPeerState,
+            self.our_peer_state().encode(),
+        )
+        .encode();
+        let sealed = self.sessions.encrypt(&payload, peer_id).ok()?;
+        let frame = self.noise_frame(MessageType::NoiseEncrypted, peer_id, sealed)?;
+        self.peer_state_proofs.entry(peer_id.to_string()).or_default().echoed = true;
+        Some(frame)
+    }
+
+    /// Encrypts anything queued while the handshake was still running, and
+    /// announces the channel.
+    fn drain_pending(&mut self, peer_id: &str) -> Vec<MeshEvent> {
+        let mut events = Vec::new();
+        let nickname = self
+            .peers
+            .get(peer_id)
+            .map(|peer| peer.nickname.clone())
+            .unwrap_or_else(|| short_display(peer_id));
+        events.push(MeshEvent::SessionUp {
+            peer_id: peer_id.to_string(),
+            nickname,
+            fingerprint: self
+                .sessions
+                .get_peer_fingerprint(peer_id)
+                .unwrap_or_default(),
+        });
+
+        for record in self.pending_dms.remove(peer_id).unwrap_or_default() {
+            match self.sealed_record_frame(peer_id, &record) {
+                Ok(frames) => events.extend(frames.into_iter().map(MeshEvent::Send)),
+                Err(reason) => events.push(MeshEvent::Notice(format!(
+                    "queued message to {} was lost: {reason}",
+                    short_display(peer_id)
+                ))),
+            }
+        }
+        events
+    }
+
+    /// One leg of a handshake. Either side may open one, and either may need to
+    /// answer, so this both consumes and produces.
+    fn handle_noise_handshake(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let sender = packet.sender_hex();
+        if !self.addressed_to_us(packet) {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        // A fresh XX message 1 (32 bytes, ephemeral key only) while we already
+        // hold a session means the peer has started over: it restarted, or its
+        // own decrypt-failure recovery kicked in. Following bitchat-android's
+        // NoiseSessionManager.processHandshakeMessageWithResult: an established
+        // or responder session is replaced; if both sides initiated at once, the
+        // side with the larger peer ID yields. Without this an established but
+        // stale session made us ignore the phone's re-handshake forever.
+        if packet.payload.len() == 32 {
+            if self.sessions.has_session(&sender) {
+                let we_initiated = !self.sessions.has_established_session(&sender)
+                    && self.handshake_started.contains_key(&sender);
+                if we_initiated && self.my_peer_id.as_str() < sender.as_str() {
+                    return Vec::new();
+                }
+                self.sessions.remove_session(&sender);
+                self.handshake_started.remove(&sender);
+                events.push(MeshEvent::Notice(format!(
+                    "{} started a new secure session; replacing ours",
+                    short_display(&sender)
+                )));
+            }
+            // Either a replacement handshake or the first message of a new one.
+            // Both are a new session generation, so the proof bookkeeping from
+            // the last one no longer applies.
+            self.reset_peer_state_proof(&sender);
+        }
+        match self
+            .sessions
+            .handle_incoming_handshake(&sender, &packet.payload)
+        {
+            Ok(Some(response)) => {
+                if let Some(frame) =
+                    self.noise_frame(MessageType::NoiseHandshake, &sender, response)
+                {
+                    events.push(MeshEvent::Send(frame));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A failed handshake leaves a half-open session behind that
+                // rejects every later attempt. Clearing it means the next try
+                // starts clean instead of failing forever.
+                self.sessions.remove_session(&sender);
+                self.reset_peer_state_proof(&sender);
+                return vec![MeshEvent::Notice(format!(
+                    "handshake with {} failed: {error}",
+                    short_display(&sender)
+                ))];
+            }
+        }
+
+        if self.sessions.has_established_session(&sender) {
+            // Every newly completed handshake, initiator or responder, sends
+            // this immediately: Android waits five seconds for it before it
+            // will offer an encrypted private-media send.
+            if let Some(frame) = self.peer_state_proof_frame(&sender) {
+                events.push(MeshEvent::Send(frame));
+            }
+            events.extend(self.drain_pending(&sender));
+        }
+        events
+    }
+
+    fn handle_noise_encrypted(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let sender = packet.sender_hex();
+        if !self.addressed_to_us(packet) {
+            return Vec::new();
+        }
+
+        let plaintext = match self.sessions.decrypt(&packet.payload, &sender) {
+            Ok(bytes) => {
+                self.decrypt_failures.remove(&sender);
+                bytes
+            }
+            Err(error) => {
+                let mut events = vec![MeshEvent::Notice(format!(
+                    "could not decrypt a message from {}: {error}",
+                    short_display(&sender)
+                ))];
+                // Mirrors bitchat-android's MessageHandler.registerDecryptFailure:
+                // a peer still encrypting to a session we no longer hold (we
+                // restarted, or it re-keyed elsewhere) will never be readable
+                // until someone handshakes again. With no session we start one
+                // straight away; with one, after three consecutive failures we
+                // drop it as stale and start over. Rate limited per peer.
+                if !matches!(error, crate::noise_protocol::NoiseError::ReplayDetected) {
+                    let established = self.sessions.has_established_session(&sender);
+                    let entry = self.decrypt_failures.entry(sender.clone()).or_insert((0, None));
+                    entry.0 += 1;
+                    let due = entry.1.map_or(true, |t: Instant| t.elapsed() > Duration::from_secs(15));
+                    if due && (!established || entry.0 >= 3) {
+                        entry.0 = 0;
+                        entry.1 = Some(Instant::now());
+                        self.sessions.remove_session(&sender);
+                        self.reset_peer_state_proof(&sender);
+                        match self.sessions.initiate_handshake(&sender) {
+                            Ok(opening) => {
+                                self.handshake_started.insert(sender.clone(), Instant::now());
+                                if let Some(frame) = self.noise_frame(MessageType::NoiseHandshake, &sender, opening) {
+                                    events.push(MeshEvent::Send(frame));
+                                    events.push(MeshEvent::Notice(format!(
+                                        "re-handshaking with {} to recover the encrypted session",
+                                        short_display(&sender)
+                                    )));
+                                }
+                            }
+                            Err(e) => events.push(MeshEvent::Notice(format!("could not re-handshake: {e}"))),
+                        }
+                    }
+                }
+                return events;
+            }
+        };
+
+        let Some(payload) = NoisePayload::decode(&plaintext) else {
+            return vec![MeshEvent::Trace(format!(
+                "unreadable encrypted payload from {}",
+                short_display(&sender)
+            ))];
+        };
+
+        match payload.kind {
+            NoisePayloadType::PrivateMessage => {
+                let Some(record) = PrivateMessagePacket::decode(&payload.body) else {
+                    return vec![MeshEvent::Trace(format!(
+                        "malformed private message from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                let content = record.content;
+                // A favourite notification travels as private-message content
+                // rather than as its own type, so it has to be caught here or
+                // the user reads "[FAVORITED]:npub1..." as a line of chat.
+                if let Some(notice) = Favorites::parse_notice(&content) {
+                    let nickname = self
+                        .peers
+                        .get(&sender)
+                        .map(|peer| peer.nickname.clone())
+                        .unwrap_or_else(|| short_display(&sender));
+                    let fingerprint = self
+                        .peers
+                        .get(&sender)
+                        .map(|peer| peer.fingerprint.clone())
+                        .unwrap_or_default();
+                    if fingerprint.is_empty() {
+                        // Without their announced key there is nothing stable
+                        // to file the address under.
+                        return vec![MeshEvent::Trace(format!(
+                            "favourite notice from unannounced {}",
+                            short_display(&sender)
+                        ))];
+                    }
+                    self.favorites.apply_notice(&fingerprint, &nickname, &notice);
+                    let mut events = vec![MeshEvent::FavoriteUpdate {
+                        peer_id: sender.clone(),
+                        nickname,
+                        fingerprint,
+                        notice,
+                    }];
+                    // Still acknowledge it: the sender is waiting on the same
+                    // ack any private message gets.
+                    if let Some(frame) = self.receipt_frame(
+                        &sender,
+                        NoisePayloadType::Delivered,
+                        &record.message_id,
+                    ) {
+                        events.push(MeshEvent::Send(frame));
+                    }
+                    return events;
+                }
+                let nickname = self
+                    .peers
+                    .get(&sender)
+                    .map(|peer| peer.nickname.clone())
+                    .unwrap_or_else(|| short_display(&sender));
+                // Acknowledge receipt immediately. Upstream expects the ack
+                // for the id it sent, so it goes out whether or not the user
+                // ever looks at the conversation - delivered is about the
+                // radio, read is about the person.
+                let mut events = vec![MeshEvent::PrivateMessage {
+                    peer_id: sender.clone(),
+                    sender: nickname,
+                    content,
+                    message_id: record.message_id.clone(),
+                }];
+                if let Some(frame) = self.receipt_frame(
+                    &sender,
+                    NoisePayloadType::Delivered,
+                    &record.message_id,
+                ) {
+                    events.push(MeshEvent::Send(frame));
+                }
+                events
+            }
+            NoisePayloadType::Delivered | NoisePayloadType::ReadReceipt => {
+                let Some(message_id) = payload.message_id() else {
+                    return vec![MeshEvent::Trace(format!(
+                        "unreadable receipt from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                let status = if payload.kind == NoisePayloadType::ReadReceipt {
+                    DeliveryStatus::Read
+                } else {
+                    DeliveryStatus::Delivered
+                };
+                vec![MeshEvent::DeliveryUpdate { message_id, status }]
+            }
+            // Someone is checking that we hold the signing key behind the noise
+            // key we announced. We answer whether or not we are verifying them:
+            // a challenge is a question about us, and refusing to answer just
+            // makes us unverifiable to a peer doing the right thing.
+            //
+            // Only the responder side exists. Issuing challenges would prove
+            // something the Noise session already establishes — it binds the
+            // static key, and a card read off a screen supplies the fingerprint
+            // to compare it against — so there is nothing left for us to ask.
+            // Answering is different: a phone verifying us needs a reply, and
+            // without one verification fails at their end.
+            NoisePayloadType::VerifyChallenge => {
+                let Some((noise_key_hex, nonce)) = crate::verification::parse_challenge(&payload.body)
+                else {
+                    return vec![MeshEvent::Trace(format!(
+                        "unreadable verification challenge from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                // Only ever sign a challenge about our own key. Signing one
+                // naming someone else's would let a peer collect our signature
+                // over a claim about a third party.
+                if noise_key_hex.to_lowercase() != hex::encode(self.noise_public_key) {
+                    return vec![MeshEvent::Trace(format!(
+                        "verification challenge from {} names another peer's key",
+                        short_display(&sender)
+                    ))];
+                }
+                let body = crate::verification::response(&noise_key_hex, &nonce, &self.signing_key);
+                let payload = NoisePayload::new(NoisePayloadType::VerifyResponse, body).encode();
+                let answer = self
+                    .sessions
+                    .encrypt(&payload, &sender)
+                    .ok()
+                    .and_then(|sealed| {
+                        self.noise_frame(MessageType::NoiseEncrypted, &sender, sealed)
+                    });
+                match answer {
+                    Some(frame) => vec![MeshEvent::Send(frame)],
+                    None => vec![MeshEvent::Trace(format!(
+                        "could not answer a verification challenge from {}",
+                        short_display(&sender)
+                    ))],
+                }
+            }
+            // The authenticated state proof every side sends after a handshake.
+            // Its capabilities are a discovery hint for private media, and its
+            // signing key ties the announce identity to this Noise session.
+            // Neither can rename the peer or change which key they are: only
+            // the announce does that.
+            NoisePayloadType::AuthenticatedPeerState => {
+                let Some(state) = AuthenticatedPeerState::decode(&payload.body) else {
+                    return vec![MeshEvent::Notice(format!(
+                        "invalid peer state proof from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                if let Some(peer) = self.peers.get_mut(&sender) {
+                    peer.capabilities = Some(state.capabilities);
+                    peer.last_seen = Instant::now();
+                }
+                let mut events = Vec::new();
+                if self.debug {
+                    events.push(MeshEvent::Trace(format!(
+                        "peer state from {}: caps {:#x}, signing key {}",
+                        short_display(&sender),
+                        state.capabilities.bits(),
+                        hex::encode(state.signing_public_key)
+                    )));
+                }
+                if let Some(frame) = self.peer_state_echo_frame(&sender) {
+                    events.push(MeshEvent::Send(frame));
+                }
+                events
+            }
+            // A file sealed to us inside the Noise session, as Android's
+            // PrivateMediaTransfer sends it (NoisePayloadType.FILE_TRANSFER).
+            NoisePayloadType::PrivateFile => {
+                let Some(file) = FilePacket::decode(&payload.body) else {
+                    return vec![MeshEvent::Notice(format!(
+                        "unreadable private file from {}",
+                        short_display(&sender)
+                    ))];
+                };
+                if let Some(peer) = self.peers.get_mut(&sender) {
+                    peer.last_seen = Instant::now();
+                }
+                let nickname = self
+                    .peers
+                    .get(&sender)
+                    .map(|peer| peer.nickname.clone())
+                    .unwrap_or_else(|| format!("{}?", short_display(&sender)));
+                vec![MeshEvent::FileReceived {
+                    peer_id: sender.clone(),
+                    sender: nickname,
+                    name: file.display_name(),
+                    mime: file.mime_type.clone(),
+                    is_image: file.is_image(),
+                    bytes: file.content,
+                    private: true,
+                }]
+            }
+            // Everything else is decoded and named but not yet acted on.
+            // Naming it matters: /debug reporting a bare number is how an
+            // unimplemented payload kind gets mistaken for a corrupt frame.
+            other => vec![MeshEvent::Trace(format!(
+                "{} from {} ({} bytes)",
+                other.label(),
+                short_display(&sender),
+                payload.body.len()
+            ))],
+        }
+    }
+
+    /// Sealed mail, either for us or for someone we might hold it for.
+    ///
+    /// One packet type serves both directions, and the tag decides which: if it
+    /// matches one of ours the mail is a delivery, otherwise it is a deposit.
+    /// Nothing else could distinguish them, and nothing else needs to — a
+    /// courier that could tell whose mail it holds would defeat the point.
+    fn handle_courier(&mut self, packet: &Packet, sender: &str) -> Vec<MeshEvent> {
+        let Some(envelope) = crate::courier::Envelope::decode(&packet.payload) else {
+            return vec![MeshEvent::Trace(format!(
+                "unreadable courier envelope from {}",
+                short_display(sender)
+            ))];
+        };
+        let now_seconds = crate::courier::now_seconds();
+        let ours = crate::courier::candidate_tags(&self.noise_public_key, now_seconds)
+            .contains(&envelope.recipient_tag);
+
+        if ours {
+            vec![MeshEvent::CourierArrived {
+                courier: sender.to_string(),
+                envelope: Box::new(envelope),
+            }]
+        } else {
+            vec![MeshEvent::CourierDeposit {
+                depositor: sender.to_string(),
+                envelope: Box::new(envelope),
+            }]
+        }
+    }
+
+    /// Opens mail carried here for us.
+    ///
+    /// Returns the message and the sender's *authenticated* key — authenticated
+    /// by the pattern rather than claimed in the payload, so neither the courier
+    /// nor anyone who captured it in transit can change who it appears to be
+    /// from.
+    ///
+    /// The block check happens here rather than in the UI, and has to: a
+    /// couriered sender is by definition absent, so there is no live session to
+    /// resolve them through. This is the only point where their full static key
+    /// is in hand.
+    pub fn open_courier(
+        &self,
+        envelope: &crate::courier::Envelope,
+    ) -> Option<(PrivateMessagePacket, String)> {
+        if envelope.prekey_id.is_some() {
+            // Sealed to a one-time prekey rather than our identity key. We do
+            // not publish prekeys, so this cannot be for us however it was
+            // addressed — and trying the static open would fail anyway.
+            return None;
+        }
+        let (typed, sender_static) = self.sessions.open_courier(&envelope.ciphertext)?;
+        let sender_fingerprint = fingerprint(&sender_static);
+        if self.is_blocked(&sender_fingerprint) {
+            return None;
+        }
+        let payload = NoisePayload::decode(&typed)?;
+        if payload.kind != NoisePayloadType::PrivateMessage {
+            return None;
+        }
+        let record = PrivateMessagePacket::decode(&payload.body)?;
+        Some((record, sender_fingerprint))
+    }
+
+    /// Seals a private message for someone we cannot reach, to be left with a
+    /// courier.
+    ///
+    /// The recipient's static key comes from a favourite's stored announce — we
+    /// cannot post to someone whose key we have never seen, which is the same
+    /// constraint as addressing them at all.
+    pub fn seal_for_courier(
+        &self,
+        recipient_static_key: &[u8],
+        content: &str,
+        expiry_ms: u64,
+        now_seconds: u64,
+    ) -> Option<(crate::courier::Envelope, String)> {
+        let record = PrivateMessagePacket::new(content);
+        let message_id = record.message_id.clone();
+        let payload = NoisePayload::new(NoisePayloadType::PrivateMessage, record.encode()?).encode();
+        let sealed = self.sessions.seal_courier(&payload, recipient_static_key)?;
+        let tag = crate::courier::recipient_tag(
+            recipient_static_key,
+            crate::courier::epoch_day(now_seconds),
+        );
+        let envelope = crate::courier::Envelope::new(tag, expiry_ms, sealed, 1, None)?;
+        Some((envelope, message_id))
+    }
+
+    /// Wraps sealed mail for the air, directed at whoever it is for.
+    pub fn courier_frame(
+        &self,
+        envelope: &crate::courier::Envelope,
+        recipient: &str,
+    ) -> Option<Vec<u8>> {
+        let mut packet = Packet::new(
+            MessageType::CourierEnvelope,
+            self.sender_bytes(),
+            envelope.encode()?,
+            MESSAGE_TTL,
+        );
+        packet = packet.with_recipient(peer_id_to_bytes(recipient));
+        packet.encode()
+    }
+
+    /// A carried Nostr event, from a peer asking us to publish it or from a
+    /// gateway passing on what it published.
+    ///
+    /// The direction has to agree with how the packet was addressed. A
+    /// `toGateway` request rides a directed packet because it is a request of
+    /// *us*; accepting a broadcast one would mean every gateway on the mesh
+    /// publishing the same event. A `fromGateway` announcement rides a
+    /// broadcast because it is for everyone; accepting it directed would let one
+    /// peer feed us a channel privately.
+    fn handle_carrier(&mut self, packet: &Packet, sender: &str) -> Vec<MeshEvent> {
+        let Some(carried) = carrier::Carrier::decode(&packet.payload) else {
+            return vec![MeshEvent::Trace(format!(
+                "unreadable carrier from {}",
+                short_display(sender)
+            ))];
+        };
+
+        let directed = self.addressed_to_us(packet);
+        let addressing_agrees = match carried.direction {
+            carrier::Direction::ToGateway => directed,
+            carrier::Direction::FromGateway => packet.is_broadcast(),
+            // Island bridging, which we do not do. Named so it is recognised
+            // and dropped rather than counted as malformed.
+            carrier::Direction::ToBridge | carrier::Direction::FromBridge => {
+                return vec![MeshEvent::Trace(format!(
+                    "bridge carrier from {} ignored",
+                    short_display(sender)
+                ))]
+            }
+        };
+        if !addressing_agrees {
+            return vec![MeshEvent::Trace(format!(
+                "carrier from {} was addressed the wrong way for its direction",
+                short_display(sender)
+            ))];
+        }
+
+        vec![MeshEvent::CarriedEvent {
+            depositor: sender.to_string(),
+            direction: carried.direction,
+            geohash: carried.geohash,
+            event_json: carried.event_json,
+        }]
+    }
+
+    /// Wraps a signed event for the mesh, either as a request to a gateway or as
+    /// a gateway's announcement to everyone.
+    pub fn carrier_frame(
+        &self,
+        carried: &carrier::Carrier,
+        recipient: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let mut packet = Packet::new(
+            MessageType::NostrCarrier,
+            self.sender_bytes(),
+            carried.encode(),
+            MESSAGE_TTL,
+        );
+        if let Some(recipient) = recipient {
+            packet = packet.with_recipient(peer_id_to_bytes(recipient));
+        }
+        packet.encode()
+    }
+
+    /// Encrypted traffic is point-to-point. A frame addressed to someone else
+    /// is not ours to open, and answering a broadcast handshake would announce
+    /// our presence to anyone who asked.
+    fn addressed_to_us(&self, packet: &Packet) -> bool {
+        packet.recipient_hex().as_deref() == Some(self.my_peer_id.as_str())
+    }
+
+    /// Frames that put a file on the mesh.
+    ///
+    /// The file becomes a fileTransfer packet, that whole packet is encoded,
+    /// and the encoded bytes are fragmented — reassembly on the far side hands
+    /// the joined bytes back to the packet decoder, so the thing being split
+    /// has to decode on its own.
+    ///
+    /// Unsigned, and not by preference. Verification re-encodes canonically and
+    /// that re-encode compresses anything from 100 bytes up, using a DEFLATE we
+    /// cannot reproduce, so a signature over a file-sized payload could never
+    /// match. Whether a phone insists on one here is untested; if it drops
+    /// these, that is the first thing to look at.
+    pub fn file_frames(
+        &mut self,
+        name: &str,
+        mime: Option<String>,
+        content: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if content.is_empty() {
+            return Err("that file is empty".to_string());
+        }
+        let size = content.len();
+        let packet = FilePacket {
+            file_name: Some(name.to_string()),
+            file_size: Some(size as u64),
+            mime_type: mime,
+            content,
+        };
+        let payload = packet.encode().ok_or_else(|| {
+            format!(
+                "{} is too large for one transfer ({:.1} MiB, limit {:.0} MiB)",
+                name,
+                size as f64 / (1024.0 * 1024.0),
+                crate::file_packet::MAX_PAYLOAD_BYTES as f64 / (1024.0 * 1024.0)
+            )
+        })?;
+
+        // A v1 frame carries at most 64 KiB of payload (2-byte length), so
+        // anything bigger goes out as a v2 frame (4-byte length), which
+        // BitChat peers decode for file transfers. Small files stay v1.
+        let needs_v2 = payload.len() > u16::MAX as usize;
+        let mut file_packet = Packet::new(
+            MessageType::FileTransfer,
+            self.sender_bytes(),
+            payload,
+            MESSAGE_TTL,
+        );
+        if needs_v2 {
+            file_packet.version = 2;
+        }
+        // Filed whole, before it is split. A peer syncing files wants the
+        // transfer, not our fragmentation of it — and the pieces we put on the
+        // air carry their own stream id for the fragment round to recover.
+        self.archive_packet(&file_packet);
+        let inner = file_packet
+            .encode()
+            .ok_or_else(|| "could not encode the transfer".to_string())?;
+
+        // A fresh id per transfer: the assembler keys on (sender, id), so
+        // reusing one would splice two files together.
+        let id: u64 = rand::random();
+        let pieces = fragment::split(
+            id,
+            MessageType::FileTransfer as u8,
+            &inner,
+            fragment::SLICE_BYTES,
+        );
+        if pieces.is_empty() {
+            return Err(format!("{name} needs more fragments than the protocol allows"));
+        }
+
+        Ok(pieces
+            .into_iter()
+            .filter_map(|payload| {
+                Packet::new(
+                    MessageType::Fragment,
+                    self.sender_bytes(),
+                    payload,
+                    MESSAGE_TTL,
+                )
+                .encode()
+            })
+            .collect())
+    }
+
+    /// Frames carrying a file to one peer only, sealed in our Noise session.
+    ///
+    /// Wire format matches Android's PrivateMediaTransfer (encrypted mode):
+    /// a NoisePayload of type 0x20 wrapping the same TLV file packet a public
+    /// transfer carries, inside a NoiseEncrypted packet addressed to the peer
+    /// (v2 when the ciphertext passes 64 KiB), fragmented with the recipient
+    /// kept on every piece. Relays see only ciphertext. Android refuses to
+    /// reassemble more than `PRIVATE_FILE_MAX_FRAGMENTS` pieces, so anything
+    /// that would need more is refused here rather than silently lost there.
+    /// `PRIVATE_FILE_MAX_BYTES` reserves room for the worst-case name, type and
+    /// encryption overhead out of that fragment budget.
+    pub fn private_file_frames(
+        &mut self,
+        peer_id: &str,
+        name: &str,
+        mime: Option<String>,
+        content: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if peer_id == self.my_peer_id {
+            return Err("that is your own peer ID".to_string());
+        }
+        if self.is_blocked(peer_id) {
+            return Err("you have blocked that peer".to_string());
+        }
+        if content.is_empty() {
+            return Err("that file is empty".to_string());
+        }
+        if !self.sessions.has_established_session(peer_id) {
+            return Err("no encrypted session with them yet".to_string());
+        }
+        let size = content.len();
+        if size > PRIVATE_FILE_MAX_BYTES {
+            return Err(private_file_too_big(name, size));
+        }
+        let packet = FilePacket {
+            file_name: Some(name.to_string()),
+            file_size: Some(size as u64),
+            mime_type: mime,
+            content,
+        };
+        let body = packet
+            .encode()
+            .ok_or_else(|| format!("{name} is too large for one transfer"))?;
+        let plaintext = NoisePayload::new(NoisePayloadType::PrivateFile, body).encode();
+        // Check the size before encrypting: a refused file must not burn a
+        // nonce the peer never sees. v1 frame = 14-byte header + 8-byte sender
+        // + 8-byte recipient, and Noise transport adds a 4-byte nonce prefix
+        // plus a 16-byte AEAD tag. Frames this large are past the padding
+        // buckets, so the frame length is exact.
+        let estimated = plaintext.len() + 20 + 14 + 8 + 8;
+        let max = PRIVATE_FILE_MAX_FRAGMENTS * fragment::SLICE_BYTES;
+        if estimated > max {
+            return Err(private_file_too_big(name, size));
+        }
+        let sealed = self
+            .sessions
+            .encrypt(&plaintext, peer_id)
+            .map_err(|error| format!("could not encrypt: {error}"))?;
+        let mut outer = Packet::new(MessageType::NoiseEncrypted, self.sender_bytes(), sealed, MESSAGE_TTL)
+            .with_recipient(peer_id_to_bytes(peer_id));
+        if outer.payload.len() > u16::MAX as usize {
+            outer.version = 2;
+        }
+        let inner = outer
+            .encode()
+            .ok_or_else(|| "could not encode the transfer".to_string())?;
+        let id: u64 = rand::random();
+        let pieces = fragment::split(id, MessageType::NoiseEncrypted as u8, &inner, fragment::SLICE_BYTES);
+        if pieces.is_empty() || pieces.len() > PRIVATE_FILE_MAX_FRAGMENTS {
+            return Err(format!("{name} is too big to send privately"));
+        }
+        Ok(pieces
+            .into_iter()
+            .filter_map(|payload| {
+                Packet::new(MessageType::Fragment, self.sender_bytes(), payload, MESSAGE_TTL)
+                    .with_recipient(peer_id_to_bytes(peer_id))
+                    .encode()
+            })
+            .collect())
+    }
+
+    // MARK: - Inbound
+
+    pub fn handle_frame(&mut self, raw: &[u8]) -> Vec<MeshEvent> {
+        let Some(packet) = Packet::decode(raw) else {
+            return vec![MeshEvent::Notice(format!(
+                "dropped an undecodable {} byte frame",
+                raw.len()
+            ))];
+        };
+        self.handle_packet(packet, false)
+    }
+
+    /// `reassembled` marks a packet that came out of the fragment buffer, so a
+    /// fragment carrying another fragment cannot recurse.
+    fn handle_packet(&mut self, packet: Packet, reassembled: bool) -> Vec<MeshEvent> {
+
+        let sender = packet.sender_hex();
+
+        let mut events = Vec::new();
+        if self.debug {
+            events.push(MeshEvent::Trace(format!(
+                "rx type={} v{} ttl={} {}B payload from {}{}",
+                packet
+                    .parsed_type()
+                    .map(|t| format!("{t:?}"))
+                    .unwrap_or_else(|| format!("0x{:02X}?", packet.msg_type)),
+                packet.version,
+                packet.ttl,
+                packet.payload.len(),
+                short_display(&sender),
+                if packet.signature.is_some() {
+                    " signed"
+                } else {
+                    " UNSIGNED"
+                }
+            )));
+        }
+
+        if sender == self.my_peer_id {
+            return events;
+        }
+
+        // Anything from a blocked peer stops here. The debug trace above is
+        // deliberately left in place: traffic vanishing with no explanation is
+        // the harder thing to diagnose.
+        if self.is_blocked(&sender) {
+            return events;
+        }
+
+        // Fragments carry a whole encoded packet; feed the reassembled bytes
+        // back through this same dispatch once every piece has arrived.
+        if packet.parsed_type() == Some(MessageType::Fragment) {
+            if reassembled {
+                events.push(MeshEvent::Notice(
+                    "ignored a fragment nested inside a fragment".to_string(),
+                ));
+                return events;
+            }
+            let Some(header) = fragment::parse(&packet) else {
+                events.push(MeshEvent::Notice(format!(
+                    "malformed fragment from {}",
+                    short_display(&sender)
+                )));
+                return events;
+            };
+            // Parsed as a well-formed fragment of a stream we are willing to
+            // reassemble. Held so a peer whose reassembly stalled can ask for
+            // the exact pieces it is missing; the packet inside is verified on
+            // its own terms once it is whole.
+            self.archive_packet(&packet);
+
+            let total = header.total;
+            match self.assembler.append(header) {
+                Append::Pending { have, total } => {
+                    if self.debug {
+                        events.push(MeshEvent::Trace(format!(
+                            "fragment {have}/{total} from {}",
+                            short_display(&sender)
+                        )));
+                    }
+                }
+                Append::Rejected(reason) => events.push(MeshEvent::Notice(format!(
+                    "dropped a fragment from {}: {reason}",
+                    short_display(&sender)
+                ))),
+                Append::Complete(bytes) => match Packet::decode(&bytes) {
+                    Some(inner) => events.extend(self.handle_packet(inner, true)),
+                    None => events.push(MeshEvent::Notice(format!(
+                        "reassembled {total} fragments from {} into an undecodable packet",
+                        short_display(&sender)
+                    ))),
+                },
+            }
+            return events;
+        }
+
+        events.extend(match packet.parsed_type() {
+            Some(MessageType::Announce) => self.handle_announce(&packet),
+            Some(MessageType::Message) => self.handle_public_message(&packet),
+            Some(MessageType::Leave) => self.handle_leave(&sender),
+            Some(MessageType::FileTransfer) => self.handle_file(&packet),
+            Some(MessageType::NostrCarrier) => self.handle_carrier(&packet, &sender),
+            Some(MessageType::CourierEnvelope) => self.handle_courier(&packet, &sender),
+            Some(MessageType::NoiseHandshake) => self.handle_noise_handshake(&packet),
+            Some(MessageType::NoiseEncrypted) => self.handle_noise_encrypted(&packet),
+            Some(MessageType::RequestSync) => self.handle_request_sync(&packet),
+            Some(_) => Vec::new(),
+            None => Vec::new(),
+        });
+        events
+    }
+
+    /// Answers a peer's gossip sync request with what their filter is missing.
+    ///
+    /// This is the half of gossip sync that helps somebody else. A peer that
+    /// was out of range asks everyone nearby what they missed and heals from
+    /// whoever replies; before this existed we were the neighbour that never
+    /// did, which made the room's history worse for anyone standing near us.
+    fn handle_request_sync(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let now = now_millis();
+
+        // A sync request is link-local, and the reply is routed back down the
+        // link it arrived on. That routing is only correct while the sender is
+        // the far end of this link, which is only guaranteed while the request
+        // has taken no hops — so the premise is enforced here rather than
+        // assumed. Without this, a peer setting one byte gets its request
+        // relayed across the mesh, and every node that hears it answers down
+        // the wrong link: the asker gets nothing and a stranger gets somebody
+        // else's history. `relay::plan` refuses to carry these at all, so both
+        // halves of that have to fail before it matters. Upstream sends ttl 0
+        // on both request forms, so this refuses nothing legitimate.
+        if packet.ttl != 0 {
+            return if self.debug {
+                vec![MeshEvent::Trace(format!(
+                    "ignored a sync request from {} that arrived with {} hop(s) left",
+                    short_display(&packet.sender_hex()),
+                    packet.ttl
+                ))]
+            } else {
+                Vec::new()
+            };
+        }
+
+        // Parse before spending the budget. The limiter exists to bound the
+        // expensive thing — diffing and replaying the archive — and its own
+        // documentation says the refusal is the answer, so a caller must not
+        // take a slot and then decline to use it. Charging for a frame we were
+        // never going to answer let eight malformed frames carrying a peer's
+        // ID silence us towards that peer for the whole window, and nothing
+        // authenticates the ID they carry.
+        let Some(request) = RequestSync::decode(&packet.payload) else {
+            return vec![MeshEvent::Notice(format!(
+                "malformed sync request from {}",
+                short_display(&packet.sender_hex())
+            ))];
+        };
+
+        // One answer can put the whole archive on the air, so a peer asking in
+        // a tight loop must not be able to spend everyone else's airtime and
+        // battery through us.
+        if !self.sync_limiter.should_respond(packet.sender_id, now) {
+            return if self.debug {
+                vec![MeshEvent::Trace(format!(
+                    "rate-limited a sync request from {}",
+                    short_display(&packet.sender_hex())
+                ))]
+            } else {
+                Vec::new()
+            };
+        }
+
+        let replies = responder::respond(&self.archive, &request, now);
+        let mut events = Vec::new();
+        if self.debug {
+            events.push(MeshEvent::Trace(format!(
+                "sync request from {} for {:?}: sending {} packet(s)",
+                short_display(&packet.sender_hex()),
+                request.requested_types().to_types(),
+                replies.len()
+            )));
+        }
+        events.extend(
+            replies
+                .iter()
+                .filter_map(|reply| reply.encode())
+                .map(MeshEvent::Reply),
+        );
+        events
+    }
+
+    /// Files a packet we have accepted, so it can be offered to a peer that
+    /// missed it.
+    ///
+    /// Called only from the points where a handler has finished vetting the
+    /// packet. Upstream does the same — its `trackPacketSeen` sits after the
+    /// signature guard in `BLEPublicMessageHandler`, not before it.
+    fn archive_packet(&mut self, packet: &Packet) {
+        self.archive.record(packet, now_millis());
+    }
+
+    /// Drops archived traffic that has aged out, and forgets peers that have
+    /// stopped asking for syncs.
+    pub fn sweep_sync_state(&mut self) {
+        self.sweep_sync_state_at(now_millis());
+    }
+
+    /// `sweep_sync_state` against a supplied clock.
+    ///
+    /// Split for the same reason `persistence::load_state_at` is: a sweep whose
+    /// only clock is `now_millis()` cannot be shown to sweep anything without
+    /// waiting fifteen minutes, so what it actually calls goes untested.
+    pub fn sweep_sync_state_at(&mut self, now_ms: u64) {
+        self.archive.drop_stale(now_ms);
+        self.sync_limiter.prune(now_ms);
+    }
+
+    fn handle_announce(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let sender = packet.sender_hex();
+        let Some(announcement) = Announcement::decode(&packet.payload) else {
+            return vec![MeshEvent::Notice(format!(
+                "malformed announce from {}",
+                short_display(&sender)
+            ))];
+        };
+
+        // The peer ID must be the one derived from the announced Noise key.
+        let derived = derive_peer_id(&announcement.noise_public_key);
+        if derived != sender {
+            return vec![MeshEvent::Notice(format!(
+                "announce sender mismatch: claimed {}, derived {}",
+                short_display(&sender),
+                short_display(&derived)
+            ))];
+        }
+
+        // We can only reproduce the canonical signing bytes when neither side
+        // compressed the payload; a compressed announce is accepted but stays
+        // unverified rather than being silently trusted.
+        let verifiable = !compression::should_compress(&packet.payload);
+        let verified = announce::verify_packet(packet, &announcement.signing_public_key);
+        if verifiable && !verified {
+            return vec![MeshEvent::Notice(format!(
+                "rejected announce from {} with a bad signature",
+                short_display(&sender)
+            ))];
+        }
+
+        // Past the sender-derivation and signature checks. An announce carries
+        // the signing key everything else is verified against, so holding it is
+        // what lets a peer who arrives later verify anything at all.
+        self.archive_packet(packet);
+
+        let nickname = announcement.nickname.clone();
+        let fingerprint = fingerprint(&announcement.noise_public_key);
+        // Cached now, while they are here, because a courier envelope for them
+        // later needs the key and a fingerprint cannot be reversed into one.
+        self.favorites
+            .note_key(&fingerprint, &announcement.noise_public_key);
+        let capabilities = announcement.advertised();
+        let claims_neighbors: Vec<String> = announcement
+            .direct_neighbors
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(hex::encode)
+            .collect();
+        let now = Instant::now();
+
+        match self.peers.get_mut(&sender) {
+            Some(existing) => {
+                // A changed Noise key under a live peer ID is impossible by
+                // construction, so only the nickname can move.
+                let renamed = existing.nickname != nickname;
+                existing.nickname = nickname.clone();
+                existing.verified = verified;
+                // Refreshed from every announce rather than kept from the
+                // first: a peer that turns gateway mode on says so by
+                // re-announcing, and one that turns it off says so the same
+                // way. Holding the old value would leave us depositing traffic
+                // with someone who has stopped carrying it.
+                existing.capabilities = capabilities;
+                // Replaced, not merged: the list is what they can see *now*, and
+                // keeping a peer they have since lost would draw a link that no
+                // longer exists.
+                existing.claims_neighbors = claims_neighbors;
+                existing.last_seen = now;
+                if renamed {
+                    vec![MeshEvent::PeerRenamed {
+                        peer_id: sender,
+                        nickname,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => {
+                self.peers.insert(
+                    sender.clone(),
+                    MeshPeer {
+                        peer_id: sender.clone(),
+                        nickname: nickname.clone(),
+                        noise_public_key: announcement.noise_public_key,
+                        signing_public_key: announcement.signing_public_key,
+                        fingerprint,
+                        verified,
+                        capabilities,
+                        claims_neighbors,
+                        last_seen: now,
+                    },
+                );
+                vec![MeshEvent::PeerAppeared {
+                    peer_id: sender,
+                    nickname,
+                }]
+            }
+        }
+    }
+
+    /// The payload is the message text itself; the sender's name comes from the
+    /// announce registry and the time from the packet header.
+    fn handle_public_message(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let sender = packet.sender_hex();
+        let Ok(content) = String::from_utf8(packet.payload.clone()) else {
+            return vec![MeshEvent::Notice(format!(
+                "non-UTF-8 message payload from {}",
+                short_display(&sender)
+            ))];
+        };
+
+        if !self.remember_packet(packet, &content) {
+            return Vec::new(); // relayed copy of something already shown
+        }
+
+        // senderID is attacker-controlled, so a registry hit alone proves
+        // nothing; upstream requires the signature to match the claimed
+        // sender's key and we do the same when we can reproduce the canonical
+        // bytes (see public_message_frames for why compression blocks that).
+        let known_peer = self.peers.get(&sender).cloned();
+        let verifiable = !compression::should_compress(&packet.payload);
+        let display_name = match &known_peer {
+            Some(peer) => {
+                if verifiable && !announce::verify_packet(packet, &peer.signing_public_key) {
+                    return vec![MeshEvent::Notice(format!(
+                        "dropped a message claiming to be from {} with a bad signature",
+                        peer.nickname
+                    ))];
+                }
+                if let Some(peer) = self.peers.get_mut(&sender) {
+                    peer.last_seen = Instant::now();
+                }
+                peer.nickname.clone()
+            }
+            // No announce seen yet: show it rather than dropping, but do not
+            // pretend to know who sent it.
+            None => format!("{}?", short_display(&sender)),
+        };
+
+        // Past every check above, so this is a message we are willing to show a
+        // user. Only now is it something we should re-offer to the room on the
+        // sender's behalf — archiving before the signature guard would make us
+        // a laundry for forged messages we ourselves refused to display.
+        self.archive_packet(packet);
+
+        vec![MeshEvent::PublicMessage {
+            peer_id: sender,
+            sender: display_name,
+            content,
+            timestamp_ms: packet.timestamp,
+        }]
+    }
+
+    /// A file sent over the radio. Arrives fragmented in practice, so this only
+    /// ever sees a whole payload thanks to the assembler.
+    fn handle_file(&mut self, packet: &Packet) -> Vec<MeshEvent> {
+        let sender_id = packet.sender_hex();
+        // A directed transfer for someone else is relayed, not kept.
+        if !packet.is_broadcast() && !self.addressed_to_us(packet) {
+            return Vec::new();
+        }
+        let Some(file) = FilePacket::decode(&packet.payload) else {
+            return vec![MeshEvent::Notice(format!(
+                "unreadable file from {}",
+                short_display(&sender_id)
+            ))];
+        };
+
+        if let Some(peer) = self.peers.get_mut(&sender_id) {
+            peer.last_seen = Instant::now();
+        }
+        let sender = self
+            .peers
+            .get(&sender_id)
+            .map(|peer| peer.nickname.clone())
+            .unwrap_or_else(|| format!("{}?", short_display(&sender_id)));
+
+        // The payload decoded as a file packet, which is as much as this
+        // handler vets. Files are not individually signed; see the note on
+        // outbound files in NOTES.md.
+        self.archive_packet(packet);
+
+        vec![MeshEvent::FileReceived {
+            peer_id: sender_id,
+            sender,
+            name: file.display_name(),
+            mime: file.mime_type.clone(),
+            is_image: file.is_image(),
+            bytes: file.content,
+            private: !packet.is_broadcast(),
+        }]
+    }
+
+    fn handle_leave(&mut self, sender: &str) -> Vec<MeshEvent> {
+        match self.peers.remove(sender) {
+            Some(peer) => vec![MeshEvent::PeerLeft {
+                peer_id: peer.peer_id,
+                nickname: peer.nickname,
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// Drops peers we have not heard from inside the retention window.
+    pub fn prune_peers(&mut self) -> Vec<MeshEvent> {
+        let expired: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.last_seen.elapsed() > PEER_RETENTION)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        expired
+            .into_iter()
+            .filter_map(|id| {
+                // Their announce claimed they were here. Once we have stopped
+                // believing that ourselves, we should stop telling the room.
+                self.archive.forget_peer(&peer_id_to_bytes(&id));
+                self.peers.remove(&id).map(|peer| MeshEvent::PeerLeft {
+                    peer_id: peer.peer_id,
+                    nickname: peer.nickname,
+                })
+            })
+            .collect()
+    }
+
+    /// Forgets every peer, e.g. after the BLE link drops.
+    pub fn clear_peers(&mut self) {
+        self.peers.clear();
+    }
+
+    pub fn nicknames(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .peers
+            .values()
+            .map(|peer| {
+                if peer.nickname.is_empty() {
+                    short_display(&peer.peer_id)
+                } else {
+                    peer.nickname.clone()
+                }
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Dedup key for a broadcast. The wire carries no message ID any more, so
+    /// upstream derives a stable one from sender + timestamp + content
+    /// (MeshMessageIdentity.stableID) and we key on the same triple. TTL is
+    /// excluded so a relayed copy collapses onto the original.
+    fn remember_packet(&mut self, packet: &Packet, content: &str) -> bool {
+        let key = format!("{}:{}:{}", packet.sender_hex(), packet.timestamp, content);
+        if !self.seen_message_ids.insert(key.clone()) {
+            return false;
+        }
+        self.seen_order.push_back(key);
+        if self.seen_order.len() > SEEN_LIMIT {
+            if let Some(oldest) = self.seen_order.pop_front() {
+                self.seen_message_ids.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+/// Splits text into pieces that each stay under the 100-byte compression
+/// threshold, preferring word boundaries. Anything at or above that size would
+/// be compressed inside the peer's signature check with an encoder we cannot
+/// match, and the message would be dropped as unsigned.
+fn split_for_signing(content: &str) -> Vec<String> {
+    split_into_chunks(content, 99)
+}
+
+/// Splits on word boundaries where it can and on char boundaries where it must.
+///
+/// Two different budgets need this. A public message is capped at 99 bytes so
+/// it stays under the compression threshold and keeps its signature valid; a
+/// private message is capped at 255 because its content sits in a TLV with a
+/// one-byte length.
+fn split_into_chunks(content: &str, max_chunk_bytes: usize) -> Vec<String> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    if content.len() <= max_chunk_bytes {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for word in content.split_whitespace() {
+        // A single word longer than the budget has to be hard-split.
+        if word.len() > max_chunk_bytes {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let mut rest = word;
+            while !rest.is_empty() {
+                let mut end = max_chunk_bytes.min(rest.len());
+                while end > 0 && !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                chunks.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+            continue;
+        }
+
+        let separator = if current.is_empty() { 0 } else { 1 };
+        if current.len() + separator + word.len() > max_chunk_bytes {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(seed: u8) -> MeshService {
+        MeshService::new([seed; 32], [seed.wrapping_add(1); 32], "tui")
+    }
+
+    #[test]
+    fn peer_id_is_derived_from_the_noise_key() {
+        let mesh = service(1);
+        assert_eq!(mesh.my_peer_id, derive_peer_id(&mesh.noise_public_key));
+        assert_eq!(mesh.my_peer_id.len(), 16);
+    }
+
+    #[test]
+    fn an_announce_from_a_peer_registers_it() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+
+        let frame = bob.announce_frame().unwrap();
+        let events = alice.handle_frame(&frame);
+
+        assert_eq!(alice.peers.len(), 1);
+        let peer = alice.peers.get(&bob.my_peer_id).unwrap();
+        assert_eq!(peer.nickname, "bob");
+        assert!(peer.verified, "a self-consistent announce must verify");
+        assert!(matches!(
+            events.as_slice(),
+            [MeshEvent::PeerAppeared { nickname, .. }] if nickname == "bob"
+        ));
+    }
+
+    #[test]
+    fn a_tampered_announce_is_rejected() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        let frame = bob.announce_frame().unwrap();
+
+        let mut packet = Packet::decode(&frame).unwrap();
+        packet.payload[1] = packet.payload[1].wrapping_add(1); // corrupt nickname length
+        let tampered = packet.encode().unwrap();
+
+        let events = alice.handle_frame(&tampered);
+        assert!(alice.peers.is_empty());
+        assert!(matches!(events.as_slice(), [MeshEvent::Notice(_)]));
+    }
+
+    #[test]
+    fn an_announce_claiming_someone_elses_peer_id_is_rejected() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        let frame = bob.announce_frame().unwrap();
+
+        let mut packet = Packet::decode(&frame).unwrap();
+        packet.sender_id = [0xAB; 8]; // does not match the announced noise key
+        let spoofed = packet.encode().unwrap();
+
+        let events = alice.handle_frame(&spoofed);
+        assert!(alice.peers.is_empty());
+        match events.as_slice() {
+            [MeshEvent::Notice(text)] => assert!(text.contains("mismatch"), "{text}"),
+            other => panic!("expected a mismatch notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn public_messages_round_trip_between_two_services() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        let frames = bob.public_message_frames("hello mesh");
+        assert_eq!(frames.len(), 1);
+        let events = alice.handle_frame(&frames[0]);
+
+        match events.as_slice() {
+            [MeshEvent::PublicMessage { sender, content, .. }] => {
+                assert_eq!(sender, "bob");
+                assert_eq!(content, "hello mesh");
+            }
+            other => panic!("expected a public message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_payload_is_the_raw_text_and_the_packet_is_signed() {
+        // Upstream drops public messages with a missing or invalid signature,
+        // and reads the payload straight back as UTF-8.
+        let mut bob = service(20);
+        let frames = bob.public_message_frames("hello mesh");
+        let packet = Packet::decode(&frames[0]).unwrap();
+        assert_eq!(packet.payload, b"hello mesh");
+        assert_eq!(packet.msg_type, MessageType::Message as u8);
+        assert!(packet.signature.is_some(), "must be signed or peers drop it");
+    }
+
+    #[test]
+    fn a_message_with_a_forged_signature_is_dropped() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        let frames = bob.public_message_frames("legit");
+        let mut packet = Packet::decode(&frames[0]).unwrap();
+        packet.payload = b"tampered".to_vec(); // signature no longer matches
+        let events = alice.handle_frame(&packet.encode().unwrap());
+
+        match events.as_slice() {
+            [MeshEvent::Notice(text)] => assert!(text.contains("bad signature"), "{text}"),
+            other => panic!("expected a rejection notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_from_an_unannounced_peer_is_shown_but_not_attributed() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        let frames = bob.public_message_frames("who am i");
+
+        match alice.handle_frame(&frames[0]).as_slice() {
+            [MeshEvent::PublicMessage { sender, content, .. }] => {
+                assert!(sender.ends_with('?'), "unknown sender must be marked: {sender}");
+                assert_eq!(content, "who am i");
+            }
+            other => panic!("expected a public message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relayed_copies_are_shown_once() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        let frames = bob.public_message_frames("echo");
+
+        assert_eq!(alice.handle_frame(&frames[0]).len(), 1);
+        assert!(
+            alice.handle_frame(&frames[0]).is_empty(),
+            "replay must be dropped"
+        );
+
+        // A relay decrements TTL; that must still count as the same message.
+        let mut relayed = Packet::decode(&frames[0]).unwrap();
+        relayed.ttl -= 1;
+        assert!(alice.handle_frame(&relayed.encode().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn long_messages_split_below_the_compression_threshold() {
+        let mut bob = service(20);
+        let long = "the mesh carries this sentence a very long way indeed ".repeat(6);
+        let frames = bob.public_message_frames(&long);
+
+        assert!(frames.len() > 1, "long text must be split");
+        for frame in &frames {
+            let packet = Packet::decode(frame).unwrap();
+            assert!(
+                !crate::compression::should_compress(&packet.payload),
+                "chunk of {} bytes would be compressed and fail verification",
+                packet.payload.len()
+            );
+            assert!(packet.signature.is_some());
+        }
+
+        // Nothing is lost in the split.
+        let rejoined: Vec<String> = frames
+            .iter()
+            .map(|frame| String::from_utf8(Packet::decode(frame).unwrap().payload).unwrap())
+            .collect();
+        assert_eq!(
+            rejoined.join(" ").split_whitespace().collect::<Vec<_>>(),
+            long.split_whitespace().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_single_oversized_word_is_hard_split() {
+        let mut bob = service(20);
+        let frames = bob.public_message_frames(&"z".repeat(250));
+        assert_eq!(frames.len(), 3);
+        for frame in &frames {
+            assert!(Packet::decode(frame).unwrap().payload.len() <= 99);
+        }
+    }
+
+    #[test]
+    fn our_own_traffic_is_ignored() {
+        let mut alice = service(1);
+        let frame = alice.announce_frame().unwrap();
+        assert!(alice.handle_frame(&frame).is_empty());
+        assert!(alice.peers.is_empty());
+    }
+
+    #[test]
+    fn leave_removes_the_peer() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+        assert_eq!(alice.peers.len(), 1);
+
+        let events = alice.handle_frame(&bob.leave_frame().unwrap());
+        assert!(alice.peers.is_empty());
+        assert!(matches!(events.as_slice(), [MeshEvent::PeerLeft { .. }]));
+    }
+
+    #[test]
+    fn a_renamed_peer_updates_in_place() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        bob.set_nickname("robert");
+        let events = alice.handle_frame(&bob.announce_frame().unwrap());
+
+        assert_eq!(alice.peers.len(), 1);
+        assert_eq!(alice.peers[&bob.my_peer_id].nickname, "robert");
+        assert!(matches!(
+            events.as_slice(),
+            [MeshEvent::PeerRenamed { nickname, .. }] if nickname == "robert"
+        ));
+    }
+
+    #[test]
+    fn a_fragmented_message_arrives_whole() {
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        // Bob sends a message, then it is split the way the radio layer splits
+        // anything too big for one write.
+        let frames = bob.public_message_frames("fragmented hello");
+        let inner = Packet::decode(&frames[0]).unwrap().encode().unwrap();
+
+        let mut events = Vec::new();
+        let chunks: Vec<&[u8]> = inner.chunks(40).collect();
+        let total = chunks.len();
+        assert!(total > 1, "test needs a real split");
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&7u64.to_be_bytes());
+            payload.extend_from_slice(&(index as u16).to_be_bytes());
+            payload.extend_from_slice(&(total as u16).to_be_bytes());
+            payload.push(MessageType::Message as u8);
+            payload.extend_from_slice(chunk);
+            let fragment = Packet::new(
+                MessageType::Fragment,
+                peer_id_to_bytes(&bob.my_peer_id),
+                payload,
+                7,
+            );
+            events.extend(alice.handle_frame(&fragment.encode().unwrap()));
+        }
+
+        match events.as_slice() {
+            [MeshEvent::PublicMessage { sender, content, .. }] => {
+                assert_eq!(sender, "bob");
+                assert_eq!(content, "fragmented hello");
+            }
+            other => panic!("expected the reassembled message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_image_sent_over_the_radio_arrives_whole() {
+        // The full path a phone-sent picture takes: a file packet, split into
+        // fragments because a BLE write is small, reassembled here.
+use crate::file_packet::FilePacket;
+
+        let mut alice = service(1);
+        let mut bob = service(20);
+        bob.set_nickname("bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+
+        // A real PNG, so the decode at the far end is genuine.
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(24, 18)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let file = FilePacket {
+            file_name: Some("photo.png".into()),
+            file_size: Some(png.len() as u64),
+            mime_type: Some("image/png".into()),
+            content: png.clone(),
+        };
+        let inner = Packet::new(
+            MessageType::FileTransfer,
+            peer_id_to_bytes(&bob.my_peer_id),
+            file.encode().expect("encodes"),
+            7,
+        )
+        .encode()
+        .expect("frames");
+        assert!(inner.len() > 200, "worth fragmenting");
+
+        let chunks: Vec<&[u8]> = inner.chunks(120).collect();
+        let total = chunks.len();
+        let mut events = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&555u64.to_be_bytes());
+            payload.extend_from_slice(&(index as u16).to_be_bytes());
+            payload.extend_from_slice(&(total as u16).to_be_bytes());
+            payload.push(MessageType::FileTransfer as u8);
+            payload.extend_from_slice(chunk);
+            let fragment = Packet::new(
+                MessageType::Fragment,
+                peer_id_to_bytes(&bob.my_peer_id),
+                payload,
+                7,
+            );
+            events.extend(alice.handle_frame(&fragment.encode().unwrap()));
+        }
+
+        match events.as_slice() {
+            [MeshEvent::FileReceived {
+                sender,
+                name,
+                mime,
+                bytes,
+                is_image,
+                ..
+            }] => {
+                assert_eq!(sender, "bob");
+                assert_eq!(name, "photo.png");
+                assert_eq!(mime.as_deref(), Some("image/png"));
+                assert!(is_image);
+                assert_eq!(bytes, &png, "the picture survives fragmentation intact");
+                // And it is a decodable image, not just matching bytes.
+                let decoded = image::load_from_memory(bytes).expect("valid png");
+                assert_eq!((decoded.width(), decoded.height()), (24, 18));
+            }
+            other => panic!("expected a received file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_image_file_is_reported_but_not_decoded() {
+use crate::file_packet::FilePacket;
+        let mut alice = service(1);
+        let file = FilePacket {
+            file_name: Some("note.m4a".into()),
+            file_size: None,
+            mime_type: Some("audio/mp4".into()),
+            content: vec![7u8; 64],
+        };
+        let packet = Packet::new(MessageType::FileTransfer, [3; 8], file.encode().unwrap(), 7);
+
+        match alice.handle_frame(&packet.encode().unwrap()).as_slice() {
+            [MeshEvent::FileReceived { is_image, name, .. }] => {
+                assert!(!is_image);
+                assert_eq!(name, "note.m4a");
+            }
+            other => panic!("expected a file event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fragment_nested_in_a_fragment_is_refused() {
+        // Otherwise a crafted packet could recurse until the stack gave out.
+        let mut alice = service(1);
+        let inner = Packet::new(MessageType::Fragment, [2; 8], vec![0u8; 13], 7)
+            .encode()
+            .unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        payload.push(MessageType::Fragment as u8);
+        payload.extend_from_slice(&inner);
+        let outer = Packet::new(MessageType::Fragment, [2; 8], payload, 7);
+
+        let events = alice.handle_frame(&outer.encode().unwrap());
+        match events.as_slice() {
+            [MeshEvent::Notice(text)] => assert!(text.contains("nested"), "{text}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_frames_do_not_panic() {
+        let mut alice = service(1);
+        for frame in [vec![], vec![0xFF; 3], vec![0x01; 64], vec![0x02; 300]] {
+            let _ = alice.handle_frame(&frame);
+        }
+        assert!(alice.peers.is_empty());
+    }
+
+    #[test]
+    fn announce_becomes_due_again_after_the_interval() {
+        let mut mesh = service(1);
+        assert!(mesh.announce_due(), "first announce is always due");
+        mesh.announce_frame().unwrap();
+        assert!(!mesh.announce_due());
+        mesh.last_announce = Some(Instant::now() - ANNOUNCE_INTERVAL - Duration::from_secs(1));
+        assert!(mesh.announce_due());
+    }
+}
+
+#[cfg(test)]
+mod noise_dm_tests {
+    use super::*;
+
+    fn pair() -> (MeshService, MeshService) {
+        (
+            MeshService::new([11; 32], [12; 32], "alice"),
+            MeshService::new([21; 32], [22; 32], "bob"),
+        )
+    }
+
+    /// Runs frames between two clients until neither has anything more to say,
+    /// collecting everything that was not a frame. A handshake is several round
+    /// trips, so a test that delivers one frame proves nothing.
+    fn settle(a: &mut MeshService, b: &mut MeshService, opening: Vec<Vec<u8>>) -> Vec<MeshEvent> {
+        let mut collected = Vec::new();
+        let mut to_b = opening;
+        let mut to_a: Vec<Vec<u8>> = Vec::new();
+
+        for _ in 0..8 {
+            if to_a.is_empty() && to_b.is_empty() {
+                break;
+            }
+            let mut next_a = Vec::new();
+            let mut next_b = Vec::new();
+
+            for frame in to_b.drain(..) {
+                for event in b.handle_frame(&frame) {
+                    match event {
+                        MeshEvent::Send(reply) => next_a.push(reply),
+                        other => collected.push(other),
+                    }
+                }
+            }
+            for frame in to_a.drain(..) {
+                for event in a.handle_frame(&frame) {
+                    match event {
+                        MeshEvent::Send(reply) => next_b.push(reply),
+                        other => collected.push(other),
+                    }
+                }
+            }
+            to_a = next_a;
+            to_b = next_b;
+        }
+        collected
+    }
+
+    #[test]
+    fn a_first_message_opens_a_channel_and_still_arrives() {
+        // The whole point of queueing: the user types once, and the text goes
+        // out by itself after the handshake rather than being dropped.
+        let (mut alice, mut bob) = pair();
+        let target = bob.my_peer_id.clone();
+        let opening = alice.dm_frames(&target, "the docks at nine").unwrap().frames;
+        assert!(!opening.is_empty(), "a DM must put something on the air");
+
+        let events = settle(&mut alice, &mut bob, opening);
+
+        assert!(
+            alice.has_encrypted_channel(&target),
+            "the initiator should end up with an established session"
+        );
+        let delivered: Vec<&MeshEvent> = events
+            .iter()
+            .filter(|event| matches!(event, MeshEvent::PrivateMessage { .. }))
+            .collect();
+        match delivered.as_slice() {
+            [MeshEvent::PrivateMessage { content, .. }] => {
+                assert_eq!(content, "the docks at nine")
+            }
+            other => panic!("expected exactly one private message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_sides_learn_the_same_fingerprint() {
+        // The fingerprint is what a user reads out to verify a peer. If the two
+        // ends disagree, verification is theatre.
+        let (mut alice, mut bob) = pair();
+        let target = bob.my_peer_id.clone();
+        let opening = alice.dm_frames(&target, "hi").unwrap().frames;
+        let events = settle(&mut alice, &mut bob, opening);
+
+        let fingerprints: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                MeshEvent::SessionUp { fingerprint, .. } => Some(fingerprint),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !fingerprints.is_empty(),
+            "establishing a channel must be announced"
+        );
+        for print in &fingerprints {
+            assert!(!print.is_empty(), "an empty fingerprint verifies nothing");
+        }
+    }
+
+    #[test]
+    fn a_reply_flows_back_over_the_same_channel() {
+        let (mut alice, mut bob) = pair();
+        let bob_id = bob.my_peer_id.clone();
+        let alice_id = alice.my_peer_id.clone();
+        let opening = alice.dm_frames(&bob_id, "ping").unwrap().frames;
+        settle(&mut alice, &mut bob, opening);
+
+        // Bob now has a session, so his reply should encrypt immediately rather
+        // than starting a second handshake.
+        assert!(bob.has_encrypted_channel(&alice_id));
+        let reply = bob.dm_frames(&alice_id, "pong").unwrap().frames;
+        let events = settle(&mut bob, &mut alice, reply);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MeshEvent::PrivateMessage { content, .. } if content == "pong"
+        )));
+    }
+
+    #[test]
+    fn encrypted_traffic_addressed_elsewhere_is_left_alone() {
+        // A DM for someone else must not be decrypted, answered, or shown.
+        let (mut alice, mut bob) = pair();
+        let mut carol = MeshService::new([31; 32], [32; 32], "carol");
+        let bob_id = bob.my_peer_id.clone();
+
+        let opening = alice.dm_frames(&bob_id, "not for carol").unwrap().frames;
+        for frame in &opening {
+            assert!(
+                carol.handle_frame(frame).is_empty(),
+                "a bystander must ignore a handshake addressed to someone else"
+            );
+        }
+        // Bob still completes normally.
+        assert!(!settle(&mut alice, &mut bob, opening).is_empty());
+    }
+
+    #[test]
+    fn a_long_message_is_split_to_fit_the_tlv_length_byte() {
+        // Content lives in a TLV whose length is one byte, so anything past 255
+        // has to become several records rather than being truncated.
+        let (mut alice, mut bob) = pair();
+        let bob_id = bob.my_peer_id.clone();
+        let opening = alice.dm_frames(&bob_id, "x").unwrap().frames;
+        settle(&mut alice, &mut bob, opening);
+
+        let long = "word ".repeat(200); // ~1000 bytes
+        let frames = alice.dm_frames(&bob_id, &long).unwrap().frames;
+        assert!(
+            frames.len() > 1,
+            "a 1000-byte message must not go out as one record"
+        );
+
+        let events = settle(&mut alice, &mut bob, frames);
+        let received: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                MeshEvent::PrivateMessage { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received.len(), frames_expected(&long));
+        for part in &received {
+            assert!(
+                part.len() <= 255,
+                "every chunk must fit the length byte, got {}",
+                part.len()
+            );
+        }
+    }
+
+    fn frames_expected(content: &str) -> usize {
+        split_into_chunks(content, MAX_TLV_VALUE).len()
+    }
+
+    #[test]
+    fn a_dm_to_yourself_is_refused() {
+        let (mut alice, _bob) = pair();
+        let me = alice.my_peer_id.clone();
+        assert!(alice.dm_frames(&me, "hello me").is_err());
+    }
+
+    #[test]
+    fn an_ambiguous_nickname_is_reported_rather_than_guessed() {
+        // Nicknames are claimed, not owned. Encrypting to whichever peer we
+        // happened to hear from first would be silently wrong.
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        for seed in [40u8, 50] {
+            let peer = MeshPeer {
+                peer_id: format!("{:016x}", seed),
+                nickname: "twin".to_string(),
+                noise_public_key: vec![seed; 32],
+                signing_public_key: vec![seed; 32],
+                fingerprint: format!("{seed:02x}"),
+                verified: false,
+                capabilities: None,
+                claims_neighbors: Vec::new(),
+                last_seen: Instant::now(),
+            };
+            alice.peers.insert(peer.peer_id.clone(), peer);
+        }
+
+        let error = alice.peer_id_for_nickname("twin").unwrap_err();
+        assert!(error.contains("2 peers"), "got: {error}");
+        assert!(alice.peer_id_for_nickname("nobody").is_err());
+    }
+
+    #[test]
+    fn an_unambiguous_nickname_resolves() {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let peer = MeshPeer {
+            peer_id: "00000000000000aa".to_string(),
+            nickname: "Bob".to_string(),
+            noise_public_key: vec![9; 32],
+            signing_public_key: vec![9; 32],
+            fingerprint: "aa".to_string(),
+            verified: false,
+            capabilities: None,
+            claims_neighbors: Vec::new(),
+            last_seen: Instant::now(),
+        };
+        alice.peers.insert(peer.peer_id.clone(), peer);
+        // Case-insensitive: users type what they see, not what was announced.
+        assert_eq!(
+            alice.peer_id_for_nickname("bob").unwrap(),
+            "00000000000000aa"
+        );
+    }
+}
+
+#[cfg(test)]
+mod blocking_tests {
+    use super::*;
+
+    fn known_peer(mesh: &mut MeshService, nickname: &str, key: u8) -> String {
+        let noise_public_key = vec![key; 32];
+        let peer_id = derive_peer_id(&noise_public_key);
+        let peer = MeshPeer {
+            peer_id: peer_id.clone(),
+            nickname: nickname.to_string(),
+            fingerprint: fingerprint(&noise_public_key),
+            noise_public_key,
+            signing_public_key: vec![key; 32],
+            verified: false,
+            capabilities: None,
+            claims_neighbors: Vec::new(),
+            last_seen: Instant::now(),
+        };
+        mesh.peers.insert(peer_id.clone(), peer);
+        peer_id
+    }
+
+    #[test]
+    fn a_peer_id_matches_its_own_fingerprint() {
+        // The whole prefix scheme rests on this: derive_peer_id is fingerprint
+        // truncated to 16 hex. If that ever stops holding, blocking silently
+        // stops matching anyone.
+        let key = vec![7u8; 32];
+        assert!(fingerprint(&key).starts_with(&derive_peer_id(&key)));
+    }
+
+    #[test]
+    fn blocking_drops_later_traffic_from_that_peer() {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+
+        // Alice learns Bob through his announce, then blocks him.
+        let announce = bob.announce_frame().unwrap();
+        assert!(!alice.handle_frame(&announce).is_empty());
+        let bob_id = bob.my_peer_id.clone();
+        assert_eq!(alice.block(&bob_id).unwrap(), "bob");
+
+        // A public message from Bob now produces nothing at all.
+        for frame in bob.public_message_frames("still here") {
+            assert!(
+                alice.handle_frame(&frame).is_empty(),
+                "a blocked peer's message must not reach the log"
+            );
+        }
+        // Nor does a fresh announce bring him back into the peer list.
+        let again = bob.announce_frame().unwrap();
+        assert!(alice.handle_frame(&again).is_empty());
+        assert!(!alice.peers.contains_key(&bob_id));
+    }
+
+    #[test]
+    fn blocking_a_peer_removes_them_from_the_roster() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "nuisance", 40);
+        assert!(mesh.peers.contains_key(&peer_id));
+        mesh.block(&peer_id).unwrap();
+        assert!(
+            !mesh.peers.contains_key(&peer_id),
+            "a blocked peer must not stay listed"
+        );
+    }
+
+    #[test]
+    fn a_peer_we_have_never_heard_announce_cannot_be_blocked() {
+        // Their key is unknown, so there is no fingerprint to store, and
+        // storing something shorter would break the state.json contract.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let error = mesh.block("00000000000000ff").unwrap_err();
+        assert!(error.contains("has not announced"), "got: {error}");
+    }
+
+    #[test]
+    fn blocking_yourself_is_refused() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let me = mesh.my_peer_id.clone();
+        assert!(mesh.block(&me).is_err());
+    }
+
+    #[test]
+    fn blocking_twice_is_reported_rather_than_silently_ignored() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "twice", 41);
+        assert!(mesh.block(&peer_id).is_ok());
+        // The peer is gone from the roster now, so the second attempt reports
+        // the peer as unknown rather than as already blocked - either way it
+        // must not appear to succeed.
+        assert!(mesh.block(&peer_id).is_err());
+    }
+
+    #[test]
+    fn unblocking_works_after_the_peer_is_forgotten() {
+        // Blocking removes the peer, so by the time a user unblocks, the
+        // nickname is usually gone and only the fingerprint remains.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "gone", 42);
+        let fingerprint_of = mesh.peers[&peer_id].fingerprint.clone();
+        mesh.block(&peer_id).unwrap();
+
+        assert!(mesh.unblock("gone").is_err(), "the nickname is no longer known");
+        assert!(mesh.unblock(&peer_id).is_ok(), "the peer ID prefix must match");
+        assert!(!mesh.is_blocked(&fingerprint_of));
+    }
+
+    #[test]
+    fn the_block_list_survives_a_restart() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "persistent", 43);
+        mesh.block(&peer_id).unwrap();
+        let saved = mesh.blocked_fingerprints();
+
+        let mut restarted = MeshService::new([1; 32], [2; 32], "me");
+        restarted.load_blocked(saved);
+        assert!(restarted.is_blocked(&peer_id));
+    }
+
+    #[test]
+    fn a_blocked_peer_cannot_be_sent_a_private_message() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let peer_id = known_peer(&mut mesh, "hostile", 44);
+        mesh.block(&peer_id).unwrap();
+        assert!(mesh.dm_frames(&peer_id, "hello").is_err());
+    }
+
+    #[test]
+    fn an_unblocked_peer_is_unaffected() {
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let blocked = known_peer(&mut mesh, "bad", 45);
+        let allowed = known_peer(&mut mesh, "good", 46);
+        mesh.block(&blocked).unwrap();
+        assert!(!mesh.is_blocked(&allowed));
+        assert!(mesh.peers.contains_key(&allowed));
+    }
+}
+
+#[cfg(test)]
+mod file_send_tests {
+    use super::*;
+
+    /// A tiny but real PNG, so the receiver's is_image check has something
+    /// honest to look at rather than a magic byte we made up.
+    fn png() -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0u8; 900]);
+        bytes
+    }
+
+    #[test]
+    fn a_file_crosses_the_mesh_and_arrives_whole() {
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let mut receiver = MeshService::new([21; 32], [22; 32], "bob");
+        let original = png();
+
+        let frames = sender
+            .file_frames("cat.png", Some("image/png".into()), original.clone())
+            .unwrap();
+        assert!(frames.len() > 1, "a 900-byte file must fragment");
+
+        let mut received = None;
+        for frame in frames {
+            for event in receiver.handle_frame(&frame) {
+                if let MeshEvent::FileReceived {
+                    name, bytes, mime, is_image, ..
+                } = event
+                {
+                    received = Some((name, bytes, mime, is_image));
+                }
+            }
+        }
+
+        let (name, bytes, mime, is_image) = received.expect("the file must arrive");
+        assert_eq!(name, "cat.png");
+        assert_eq!(bytes, original, "every byte must survive the round trip");
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert!(is_image);
+    }
+
+    #[test]
+    fn nothing_arrives_until_the_last_fragment_does() {
+        // A half-delivered file must not surface as a truncated one.
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let mut receiver = MeshService::new([21; 32], [22; 32], "bob");
+        let frames = sender
+            .file_frames("cat.png", Some("image/png".into()), png())
+            .unwrap();
+
+        let (all_but_last, _) = frames.split_at(frames.len() - 1);
+        for frame in all_but_last {
+            for event in receiver.handle_frame(frame) {
+                assert!(
+                    !matches!(event, MeshEvent::FileReceived { .. }),
+                    "a partial transfer must not be delivered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_transfers_in_flight_do_not_splice_together() {
+        // The assembler keys on (sender, id); a reused id would interleave two
+        // files into one corrupt result.
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let first = sender
+            .file_frames("a.png", Some("image/png".into()), png())
+            .unwrap();
+        let second = sender
+            .file_frames("b.png", Some("image/png".into()), png())
+            .unwrap();
+
+        let id_of = |frame: &Vec<u8>| {
+            let packet = Packet::decode(frame).unwrap();
+            u64::from_be_bytes(packet.payload[0..8].try_into().unwrap())
+        };
+        assert_ne!(
+            id_of(&first[0]),
+            id_of(&second[0]),
+            "each transfer needs its own id"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_refused_before_any_airtime_is_spent() {
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        assert!(sender.file_frames("empty.png", None, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_file_past_the_payload_limit_is_refused_with_its_size() {
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let huge = vec![0u8; crate::file_packet::MAX_PAYLOAD_BYTES + 1];
+        let error = sender.file_frames("huge.bin", None, huge).unwrap_err();
+        assert!(error.contains("too large"), "got: {error}");
+    }
+
+    #[test]
+    fn a_file_with_no_known_extension_still_sends() {
+        // The mime type is a rendering hint, not a requirement.
+        let mut sender = MeshService::new([11; 32], [12; 32], "alice");
+        let mut receiver = MeshService::new([21; 32], [22; 32], "bob");
+        let frames = sender
+            .file_frames("notes.dat", None, b"plain bytes".to_vec())
+            .unwrap();
+
+        let mut arrived = false;
+        for frame in frames {
+            for event in receiver.handle_frame(&frame) {
+                if let MeshEvent::FileReceived { is_image, name, .. } = event {
+                    assert_eq!(name, "notes.dat");
+                    assert!(!is_image);
+                    arrived = true;
+                }
+            }
+        }
+        assert!(arrived);
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    /// Two clients with a Noise session already up. Shared with the
+    /// verification tests, which need the same starting point.
+    pub(super) fn established() -> (MeshService, MeshService, String, String) {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        let (alice_id, bob_id) = (alice.my_peer_id.clone(), bob.my_peer_id.clone());
+
+        // Walk the handshake through so both ends hold a session.
+        let mut to_bob = alice.dm_frames(&bob_id, "opening").unwrap().frames;
+        let mut to_alice: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..8 {
+            let (mut next_a, mut next_b) = (Vec::new(), Vec::new());
+            for frame in to_bob.drain(..) {
+                for event in bob.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_a.push(reply);
+                    }
+                }
+            }
+            for frame in to_alice.drain(..) {
+                for event in alice.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_b.push(reply);
+                    }
+                }
+            }
+            if next_a.is_empty() && next_b.is_empty() {
+                break;
+            }
+            to_alice = next_a;
+            to_bob = next_b;
+        }
+        (alice, bob, alice_id, bob_id)
+    }
+
+    /// Two clients with a session up, where the encrypted frames each produced
+    /// are captured rather than delivered.
+    ///
+    /// Only handshake frames are walked between the sides, so neither peer has
+    /// seen the other's authenticated-peer-state proof. That leaves both echo
+    /// flags untouched, which is what the echo test needs to observe.
+    pub(super) fn established_with_captured_encrypted(
+    ) -> (MeshService, MeshService, String, String, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        let (alice_id, bob_id) = (alice.my_peer_id.clone(), bob.my_peer_id.clone());
+
+        let mut to_bob = alice.dm_frames(&bob_id, "opening").unwrap().frames;
+        let mut to_alice: Vec<Vec<u8>> = Vec::new();
+        let mut from_alice: Vec<Vec<u8>> = Vec::new();
+        let mut from_bob: Vec<Vec<u8>> = Vec::new();
+
+        for _ in 0..8 {
+            let (mut next_a, mut next_b) = (Vec::new(), Vec::new());
+            for frame in to_bob.drain(..) {
+                from_alice.push(frame.clone());
+                for event in bob.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_a.push(reply);
+                    }
+                }
+            }
+            for frame in to_alice.drain(..) {
+                from_bob.push(frame.clone());
+                for event in alice.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_b.push(reply);
+                    }
+                }
+            }
+            // next_a came from bob and next_b from alice, whether they are
+            // handshake messages or encrypted payloads.
+            from_bob.extend(next_a.iter().cloned());
+            from_alice.extend(next_b.iter().cloned());
+
+            let is_handshake = |frame: &[u8]| {
+                Packet::decode(frame)
+                    .is_some_and(|packet| packet.msg_type == MessageType::NoiseHandshake as u8)
+            };
+            to_alice = next_a
+                .into_iter()
+                .filter(|frame| is_handshake(frame))
+                .collect();
+            to_bob = next_b
+                .into_iter()
+                .filter(|frame| is_handshake(frame))
+                .collect();
+            if to_alice.is_empty() && to_bob.is_empty() {
+                break;
+            }
+        }
+        (alice, bob, alice_id, bob_id, from_alice, from_bob)
+    }
+
+    #[test]
+    fn receiving_a_private_message_acknowledges_it_unprompted() {
+        // Delivered is about the radio, not the reader, so it goes out without
+        // anyone opening the conversation.
+        let (mut alice, mut bob, _, bob_id) = established();
+        let sent = alice.dm_frames(&bob_id, "are you there").unwrap();
+        let message_id = sent.ids[0].clone();
+
+        let mut ack = None;
+        for frame in sent.frames {
+            for event in bob.handle_frame(&frame) {
+                if let MeshEvent::Send(reply) = event {
+                    ack = Some(reply);
+                }
+            }
+        }
+
+        // That acknowledgement, delivered back, must tick the right message.
+        let ack = ack.expect("an inbound private message must be acknowledged");
+        let events = alice.handle_frame(&ack);
+        match events.as_slice() {
+            [MeshEvent::DeliveryUpdate { message_id: id, status }] => {
+                assert_eq!(*id, message_id, "the ack must name the message we sent");
+                assert_eq!(*status, DeliveryStatus::Delivered);
+            }
+            other => panic!("expected a delivery update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_receipt_reports_read_not_delivered() {
+        let (mut alice, mut bob, alice_id, bob_id) = established();
+        let sent = alice.dm_frames(&bob_id, "did you see this").unwrap();
+        let message_id = sent.ids[0].clone();
+        for frame in sent.frames {
+            bob.handle_frame(&frame);
+        }
+
+        for frame in bob.read_receipt_frames(&alice_id, std::slice::from_ref(&message_id)) {
+            match alice.handle_frame(&frame).as_slice() {
+                [MeshEvent::DeliveryUpdate { message_id: id, status }] => {
+                    assert_eq!(*id, message_id);
+                    assert_eq!(*status, DeliveryStatus::Read);
+                }
+                other => panic!("expected a read receipt, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_outranks_delivered_however_they_race() {
+        // The two acknowledgements can arrive in either order; a late delivered
+        // must not walk a read message backwards.
+        assert!(DeliveryStatus::Read > DeliveryStatus::Delivered);
+    }
+
+    #[test]
+    fn a_receipt_is_not_worth_opening_a_channel_for() {
+        // No session, no receipt - and no error either. The peer will resend
+        // if it cares.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(mesh
+            .read_receipt_frames("00000000000000aa", &["some-id".to_string()])
+            .is_empty());
+    }
+
+    #[test]
+    fn every_chunk_of_a_split_message_is_acknowledged_separately() {
+        // A long message becomes several records, each with its own id, so a
+        // single tick would be reporting on only one of them.
+        let (mut alice, _bob, _, bob_id) = established();
+        let sent = alice.dm_frames(&bob_id, &"word ".repeat(200)).unwrap();
+        assert!(sent.ids.len() > 1);
+        assert_eq!(sent.ids.len(), sent.frames.len());
+        let unique: std::collections::HashSet<&String> = sent.ids.iter().collect();
+        assert_eq!(unique.len(), sent.ids.len(), "ids must not repeat");
+    }
+}
+
+#[cfg(test)]
+mod peer_state_tests {
+    use super::receipt_tests::established_with_captured_encrypted;
+    use super::*;
+
+    /// Decrypts every encrypted frame one side produced and returns the peer
+    /// states it carried, in send order.
+    fn proofs_from(
+        recipient: &mut MeshService,
+        sender: &str,
+        frames: &[Vec<u8>],
+    ) -> Vec<AuthenticatedPeerState> {
+        let mut proofs = Vec::new();
+        for frame in frames {
+            let Some(packet) = Packet::decode(frame.as_slice()) else {
+                continue;
+            };
+            if packet.msg_type != MessageType::NoiseEncrypted as u8 {
+                continue;
+            }
+            let Ok(plaintext) = recipient.sessions.decrypt(&packet.payload, sender) else {
+                continue;
+            };
+            let Some(payload) = NoisePayload::decode(&plaintext) else {
+                continue;
+            };
+            if payload.kind != NoisePayloadType::AuthenticatedPeerState {
+                continue;
+            }
+            if let Some(state) = AuthenticatedPeerState::decode(&payload.body) {
+                proofs.push(state);
+            }
+        }
+        proofs
+    }
+
+    fn first_encrypted(frames: &[Vec<u8>]) -> Vec<u8> {
+        frames
+            .iter()
+            .find(|frame| {
+                Packet::decode(frame.as_slice())
+                    .is_some_and(|packet| packet.msg_type == MessageType::NoiseEncrypted as u8)
+            })
+            .expect("the handshake produces an encrypted frame")
+            .clone()
+    }
+
+    #[test]
+    fn both_sides_prove_private_media_and_their_signing_key_after_a_handshake() {
+        let (mut alice, mut bob, alice_id, bob_id, from_alice, from_bob) =
+            established_with_captured_encrypted();
+        let alice_key = alice.signing_key.verifying_key().to_bytes();
+        let bob_key = bob.signing_key.verifying_key().to_bytes();
+
+        let alice_proofs = proofs_from(&mut bob, &alice_id, &from_alice);
+        let bob_proofs = proofs_from(&mut alice, &bob_id, &from_bob);
+
+        assert_eq!(alice_proofs.len(), 1, "alice proves her state once");
+        assert_eq!(bob_proofs.len(), 1, "bob proves his state once");
+        for proof in alice_proofs.iter().chain(bob_proofs.iter()) {
+            assert!(
+                proof
+                    .capabilities
+                    .has(announce::Capabilities::PRIVATE_MEDIA),
+                "the proof must say we can send private media"
+            );
+        }
+        assert_eq!(alice_proofs[0].signing_public_key, alice_key);
+        assert_eq!(bob_proofs[0].signing_public_key, bob_key);
+    }
+
+    #[test]
+    fn the_first_valid_proof_is_echoed_once_and_a_repeat_is_ignored() {
+        let (mut alice, mut bob, _, bob_id, from_alice, _) =
+            established_with_captured_encrypted();
+        let proof = first_encrypted(&from_alice);
+
+        let first = bob.handle_frame(&proof);
+        let echoes: Vec<Vec<u8>> = first
+            .into_iter()
+            .filter_map(|event| match event {
+                MeshEvent::Send(frame) => Some(frame),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            echoes.len(),
+            1,
+            "the first accepted proof gets exactly one echo"
+        );
+
+        // A fresh ciphertext carrying the same state, not a replay of the first.
+        alice.peer_state_proofs.remove(&bob_id);
+        let repeat = alice
+            .peer_state_proof_frame(&bob_id)
+            .expect("alice can prove her state again");
+        let second = bob.handle_frame(&repeat);
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event, MeshEvent::Send(_))),
+            "a repeated proof must not be echoed again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod favorite_tests {
+    use super::*;
+
+    /// Two clients with an encrypted channel already up.
+    fn linked() -> (MeshService, MeshService, String, String) {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        // Each learns the other's key, which is what a fingerprint needs.
+        let announce = bob.announce_frame().unwrap();
+        alice.handle_frame(&announce);
+        let announce = alice.announce_frame().unwrap();
+        bob.handle_frame(&announce);
+
+        let (alice_id, bob_id) = (alice.my_peer_id.clone(), bob.my_peer_id.clone());
+        let mut to_bob = alice.dm_frames(&bob_id, "hello").unwrap().frames;
+        let mut to_alice: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..8 {
+            let (mut next_a, mut next_b) = (Vec::new(), Vec::new());
+            for frame in to_bob.drain(..) {
+                for event in bob.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_a.push(reply);
+                    }
+                }
+            }
+            for frame in to_alice.drain(..) {
+                for event in alice.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        next_b.push(reply);
+                    }
+                }
+            }
+            if next_a.is_empty() && next_b.is_empty() {
+                break;
+            }
+            to_alice = next_a;
+            to_bob = next_b;
+        }
+        (alice, bob, alice_id, bob_id)
+    }
+
+    #[test]
+    fn favouriting_hands_over_an_address_without_printing_plumbing() {
+        let (mut alice, mut bob, _, bob_id) = linked();
+        let sent = alice
+            .favorite_frames(&bob_id, true, "npub1alice")
+            .unwrap();
+
+        let mut update = None;
+        for frame in sent.frames {
+            for event in bob.handle_frame(&frame) {
+                match event {
+                    MeshEvent::FavoriteUpdate { notice, .. } => update = Some(notice),
+                    // The marker must never reach the chat log.
+                    MeshEvent::PrivateMessage { content, .. } => {
+                        panic!("favourite marker leaked into chat: {content}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let notice = update.expect("bob must see the favourite");
+        assert!(notice.is_favorite);
+        assert_eq!(notice.their_nostr_key.as_deref(), Some("npub1alice"));
+
+        // And Bob can now find Alice by that address.
+        let fingerprint = fingerprint(&alice.noise_public_key);
+        assert_eq!(
+            bob.favorites.nostr_key_for(&fingerprint),
+            Some("npub1alice")
+        );
+        assert_eq!(
+            bob.favorites.fingerprint_for_nostr_key("npub1alice"),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn ordinary_chat_still_reaches_the_log() {
+        // The interception must not swallow anything else.
+        let (mut alice, mut bob, _, bob_id) = linked();
+        let sent = alice.dm_frames(&bob_id, "I favourited your post").unwrap();
+        let mut delivered = false;
+        for frame in sent.frames {
+            for event in bob.handle_frame(&frame) {
+                if let MeshEvent::PrivateMessage { content, .. } = event {
+                    assert_eq!(content, "I favourited your post");
+                    delivered = true;
+                }
+            }
+        }
+        assert!(delivered, "normal chat must not be intercepted");
+    }
+
+    #[test]
+    fn our_own_half_is_recorded_when_we_favourite() {
+        let (mut alice, _bob, _, bob_id) = linked();
+        alice.favorite_frames(&bob_id, true, "npub1alice").unwrap();
+        let bob_fingerprint = fingerprint(&_bob.noise_public_key);
+        let entry = alice.favorites.get(&bob_fingerprint).unwrap();
+        assert!(entry.we_favorited);
+        // Not mutual until Bob answers, and not reachable until he sends his.
+        assert!(!entry.mutual());
+        assert!(!entry.reachable_over_nostr());
+    }
+
+    #[test]
+    fn favouriting_an_unannounced_peer_is_refused() {
+        // No announce means no key, so nothing stable to file an address under.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(mesh
+            .favorite_frames("00000000000000ff", true, "npub1me")
+            .is_err());
+    }
+
+    #[test]
+    fn a_mutual_favourite_is_reachable_from_both_ends() {
+        let (mut alice, mut bob, alice_id, bob_id) = linked();
+
+        let deliver = |from: &mut MeshService, to: &mut MeshService, frames: Vec<Vec<u8>>| {
+            for frame in frames {
+                for event in to.handle_frame(&frame) {
+                    if let MeshEvent::Send(reply) = event {
+                        from.handle_frame(&reply);
+                    }
+                }
+            }
+        };
+
+        let sent = alice.favorite_frames(&bob_id, true, "npub1alice").unwrap();
+        deliver(&mut alice, &mut bob, sent.frames);
+        let sent = bob.favorite_frames(&alice_id, true, "npub1bob").unwrap();
+        deliver(&mut bob, &mut alice, sent.frames);
+
+        let bob_fp = fingerprint(&bob.noise_public_key);
+        let alice_fp = fingerprint(&alice.noise_public_key);
+        assert!(alice.favorites.get(&bob_fp).unwrap().mutual());
+        assert!(bob.favorites.get(&alice_fp).unwrap().mutual());
+        assert_eq!(
+            alice.favorites.nostr_key_for(&bob_fp),
+            Some("npub1bob")
+        );
+    }
+}
+
+#[cfg(test)]
+mod courier_tests {
+    use super::*;
+    use crate::courier::{self, Envelope, TAG_BYTES};
+
+    fn sealed_for(recipient: &MeshService, now_seconds: u64) -> Envelope {
+        // Addressed the way a real sender would: by tag, derived from the
+        // recipient's announced static key and today's date.
+        let tag = courier::recipient_tag(&recipient.noise_public_key, courier::epoch_day(now_seconds));
+        Envelope::new(
+            tag,
+            now_seconds * 1000 + 3_600_000,
+            b"sealed to them, opaque to everyone else".to_vec(),
+            1,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mail_for_somebody_else_is_a_deposit() {
+        // The courier's whole position: it can tell the mail is not for it, and
+        // that is the only thing it can tell.
+        let depositor = MeshService::new([21; 32], [22; 32], "alice");
+        let mut post_office = MeshService::new([11; 32], [12; 32], "laptop");
+        let stranger = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        let envelope = sealed_for(&stranger, now);
+        let frame = depositor
+            .courier_frame(&envelope, &post_office.my_peer_id)
+            .expect("a directed deposit");
+
+        let events = post_office.handle_frame(&frame);
+        let deposit = events.iter().find_map(|event| match event {
+            MeshEvent::CourierDeposit {
+                depositor,
+                envelope,
+            } => Some((depositor, envelope)),
+            _ => None,
+        });
+        let (who, held) = deposit.expect("recognised as somebody else's mail");
+        assert_eq!(who, &depositor.my_peer_id);
+        assert_eq!(held.ciphertext, envelope.ciphertext, "carried unaltered");
+    }
+
+    #[test]
+    fn mail_for_us_is_a_delivery() {
+        // Same packet type, opposite meaning, and the tag is the only thing that
+        // distinguishes them — which is exactly as much as a courier should know.
+        let courier_peer = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut recipient = MeshService::new([11; 32], [12; 32], "bob");
+        let now = courier::now_seconds();
+
+        let envelope = sealed_for(&recipient, now);
+        let frame = courier_peer
+            .courier_frame(&envelope, &recipient.my_peer_id)
+            .unwrap();
+
+        let arrived = recipient.handle_frame(&frame).into_iter().any(|event| {
+            matches!(event, MeshEvent::CourierArrived { .. })
+        });
+        assert!(arrived, "our own tag must be recognised");
+    }
+
+    #[test]
+    fn mail_sealed_yesterday_still_arrives_today() {
+        // Tags rotate at midnight and clocks disagree. Checking only today would
+        // fail to deliver precisely the mail that has been waiting longest.
+        let courier_peer = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut recipient = MeshService::new([11; 32], [12; 32], "bob");
+        let now = courier::now_seconds();
+
+        let yesterday = courier::recipient_tag(
+            &recipient.noise_public_key,
+            courier::epoch_day(now) - 1,
+        );
+        let envelope =
+            Envelope::new(yesterday, now * 1000 + 3_600_000, b"waited overnight".to_vec(), 1, None)
+                .unwrap();
+        let frame = courier_peer
+            .courier_frame(&envelope, &recipient.my_peer_id)
+            .unwrap();
+
+        assert!(recipient
+            .handle_frame(&frame)
+            .into_iter()
+            .any(|event| matches!(event, MeshEvent::CourierArrived { .. })));
+    }
+
+    #[test]
+    fn a_courier_cannot_tell_whose_mail_it_holds() {
+        // Stated as a test because it is the property the whole scheme rests on:
+        // the tag is keyed on the recipient's public key, so holding an envelope
+        // reveals nothing about its destination to anyone who does not already
+        // know that key.
+        let bob = MeshService::new([11; 32], [12; 32], "bob");
+        let carol = MeshService::new([31; 32], [32; 32], "carol");
+        let now = courier::now_seconds();
+
+        let for_bob = sealed_for(&bob, now);
+        let for_carol = sealed_for(&carol, now);
+        assert_ne!(for_bob.recipient_tag, for_carol.recipient_tag);
+
+        // A courier holding Bob's mail can only recognise it as Bob's by
+        // computing his tag — which needs his announced key.
+        let tags = courier::candidate_tags(&bob.noise_public_key, now);
+        assert!(tags.contains(&for_bob.recipient_tag));
+        assert!(!tags.contains(&for_carol.recipient_tag));
+    }
+
+    #[test]
+    fn an_unreadable_envelope_is_not_fatal() {
+        let mut us = MeshService::new([11; 32], [12; 32], "us");
+        let frame = Packet::new(
+            MessageType::CourierEnvelope,
+            peer_id_to_bytes("aa11bb22cc33dd44"),
+            vec![0xFF; 20],
+            7,
+        )
+        .with_recipient(peer_id_to_bytes(&us.my_peer_id))
+        .encode()
+        .unwrap();
+        assert!(!us.handle_frame(&frame).into_iter().any(|event| matches!(
+            event,
+            MeshEvent::CourierDeposit { .. } | MeshEvent::CourierArrived { .. }
+        )));
+    }
+
+    #[test]
+    fn a_delivery_frame_round_trips_the_envelope_exactly() {
+        // A courier that altered a byte would break a seal it cannot even read,
+        // and the failure would surface at the recipient rather than here.
+        let courier_peer = MeshService::new([21; 32], [22; 32], "laptop");
+        let recipient = MeshService::new([11; 32], [12; 32], "bob");
+        let envelope = sealed_for(&recipient, courier::now_seconds());
+
+        let frame = courier_peer
+            .courier_frame(&envelope, &recipient.my_peer_id)
+            .unwrap();
+        let packet = Packet::decode(&frame).unwrap();
+        assert_eq!(Envelope::decode(&packet.payload).as_ref(), Some(&envelope));
+        assert_eq!(packet.recipient_hex().as_deref(), Some(recipient.my_peer_id.as_str()));
+    }
+
+    #[test]
+    fn a_message_reaches_an_absent_peer_through_a_stranger() {
+        // The whole point, end to end, with no infrastructure anywhere in it.
+        // Alice cannot reach Bob. She hands the sealed message to a courier who
+        // cannot read it. Bob later collects it from the courier and reads it,
+        // and can prove Alice wrote it.
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut courier_node = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut bob = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        // Alice knows Bob's announced key from when he was last around.
+        let bob_fingerprint = crate::peer_id::fingerprint(&bob.noise_public_key);
+        alice.favorites.apply_notice(
+            &bob_fingerprint,
+            "bob",
+            &crate::favorites::FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: None,
+            },
+        );
+        alice
+            .favorites
+            .note_key(&bob_fingerprint, &bob.noise_public_key);
+
+        // She seals a message for him and hands it to the courier.
+        let (envelope, message_id) = alice
+            .seal_for_courier(
+                &bob.noise_public_key,
+                "the back gate is open",
+                (now + 3600) * 1000,
+                now,
+            )
+            .expect("sealing to a key we hold");
+        let deposit = alice
+            .courier_frame(&envelope, &courier_node.my_peer_id)
+            .unwrap();
+
+        // The courier recognises it as somebody else's and cannot read it.
+        let held = courier_node
+            .handle_frame(&deposit)
+            .into_iter()
+            .find_map(|event| match event {
+                MeshEvent::CourierDeposit { envelope, .. } => Some(*envelope),
+                _ => None,
+            })
+            .expect("shelved rather than opened");
+        assert!(
+            courier_node.open_courier(&held).is_none(),
+            "a courier must not be able to read what it carries"
+        );
+
+        // Bob turns up. The courier computes his tag from his announced key and
+        // hands over what matches.
+        courier_node.handle_frame(&bob.announce_frame().unwrap());
+        let bob_peer = &courier_node.peers[&bob.my_peer_id];
+        let tags = courier::candidate_tags(&bob_peer.noise_public_key, now);
+        assert!(
+            tags.contains(&held.recipient_tag),
+            "the courier can tell it is his without ever knowing it was"
+        );
+
+        let delivery = courier_node
+            .courier_frame(&held, &bob.my_peer_id)
+            .unwrap();
+        let arrived = bob
+            .handle_frame(&delivery)
+            .into_iter()
+            .find_map(|event| match event {
+                MeshEvent::CourierArrived { envelope, .. } => Some(*envelope),
+                _ => None,
+            })
+            .expect("bob recognises his own tag");
+
+        let (record, sender_fingerprint) = bob.open_courier(&arrived).expect("bob can read it");
+        assert_eq!(record.content, "the back gate is open");
+        assert_eq!(record.message_id, message_id, "the same letter throughout");
+        assert_eq!(
+            sender_fingerprint,
+            crate::peer_id::fingerprint(&alice.noise_public_key),
+            "and it is provably from alice"
+        );
+    }
+
+    #[test]
+    fn mail_from_a_blocked_sender_is_not_read() {
+        // The block check has to happen at the open, because a couriered sender
+        // is absent by definition — there is no live session to resolve them
+        // through, and this is the only point their full key is in hand.
+        let alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        let (envelope, _) = alice
+            .seal_for_courier(&bob.noise_public_key, "let me in", (now + 3600) * 1000, now)
+            .unwrap();
+        assert!(bob.open_courier(&envelope).is_some(), "readable before blocking");
+
+        let mut blocked = HashSet::new();
+        blocked.insert(crate::peer_id::fingerprint(&alice.noise_public_key));
+        bob.load_blocked(blocked);
+        assert!(
+            bob.open_courier(&envelope).is_none(),
+            "a block must hold for mail that arrived without them"
+        );
+    }
+
+    #[test]
+    fn mail_sealed_to_a_prekey_is_left_alone() {
+        // We do not publish prekeys, so such an envelope cannot be for us however
+        // it is addressed. Refused up front rather than by failing to decrypt.
+        let alice = MeshService::new([11; 32], [12; 32], "alice");
+        let bob = MeshService::new([31; 32], [32; 32], "bob");
+        let now = courier::now_seconds();
+
+        let (envelope, _) = alice
+            .seal_for_courier(&bob.noise_public_key, "hello", (now + 3600) * 1000, now)
+            .unwrap();
+        let forward_secret = Envelope::new(
+            envelope.recipient_tag,
+            envelope.expiry_ms,
+            envelope.ciphertext.clone(),
+            1,
+            Some(7),
+        )
+        .unwrap();
+        assert!(bob.open_courier(&forward_secret).is_none());
+    }
+
+    #[test]
+    fn every_tag_is_sixteen_bytes_whatever_the_key() {
+        for seed in [0u8, 1, 0x7f, 0xff] {
+            let tag = courier::recipient_tag(&[seed; 32], 0);
+            assert_eq!(tag.len(), TAG_BYTES);
+        }
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+    use crate::nostr::carrier::{Carrier, Direction};
+
+    fn signed_event() -> crate::nostr::event::Event {
+        use secp256k1::{Keypair, SecretKey, SECP256K1};
+        let secret = SecretKey::from_byte_array([9u8; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
+        crate::nostr::event::Event::signed(
+            &keypair,
+            1_700_000_000,
+            crate::nostr::event::KIND_EPHEMERAL,
+            crate::nostr::event::geohash_tags("9q", Some("phone"), false),
+            "no data, but a radio".into(),
+        )
+    }
+
+    #[test]
+    fn a_deposit_reaches_the_gateway_with_its_signature_intact() {
+        // The whole path: a peer with no internet signs locally, hands the
+        // finished event over Bluetooth, and the gateway can still prove who
+        // wrote it. If the JSON did not survive byte-for-byte the signature
+        // would fail at the relay, not here.
+        let phone = MeshService::new([21; 32], [22; 32], "phone");
+        let mut gateway = MeshService::new([11; 32], [12; 32], "laptop");
+        let event = signed_event();
+        let json = serde_json::to_string(&event).unwrap();
+
+        let carried = Carrier::new(Direction::ToGateway, "9q", &json).unwrap();
+        let frame = phone
+            .carrier_frame(&carried, Some(&gateway.my_peer_id))
+            .expect("a directed carrier");
+
+        let events = gateway.handle_frame(&frame);
+        let deposit = events
+            .iter()
+            .find_map(|event| match event {
+                MeshEvent::CarriedEvent {
+                    depositor,
+                    direction,
+                    geohash,
+                    event_json,
+                } => Some((depositor, direction, geohash, event_json)),
+                _ => None,
+            })
+            .expect("the gateway sees the deposit");
+
+        assert_eq!(deposit.0, &phone.my_peer_id);
+        assert_eq!(*deposit.1, Direction::ToGateway);
+        assert_eq!(deposit.2, "9q");
+        let arrived: crate::nostr::event::Event = serde_json::from_str(deposit.3).unwrap();
+        assert_eq!(arrived, event);
+        assert!(arrived.verify(), "still provably theirs");
+    }
+
+    #[test]
+    fn a_request_to_publish_must_be_addressed_to_us() {
+        // Broadcast it and every gateway on the mesh publishes the same event.
+        // The direction and the addressing have to agree.
+        let phone = MeshService::new([21; 32], [22; 32], "phone");
+        let mut gateway = MeshService::new([11; 32], [12; 32], "laptop");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        let carried = Carrier::new(Direction::ToGateway, "9q", &json).unwrap();
+        let broadcast = phone.carrier_frame(&carried, None).unwrap();
+
+        assert!(
+            !gateway
+                .handle_frame(&broadcast)
+                .iter()
+                .any(|event| matches!(event, MeshEvent::CarriedEvent { .. })),
+            "a broadcast request to publish is not a request of anyone"
+        );
+    }
+
+    #[test]
+    fn an_announcement_to_the_mesh_must_not_be_directed() {
+        // Directed, it would let one peer feed us a channel privately — a
+        // version of the world only we can see.
+        let carrier_peer = MeshService::new([21; 32], [22; 32], "gateway");
+        let mut phone = MeshService::new([11; 32], [12; 32], "phone");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        let carried = Carrier::new(Direction::FromGateway, "9q", &json).unwrap();
+        let directed = carrier_peer
+            .carrier_frame(&carried, Some(&phone.my_peer_id))
+            .unwrap();
+
+        assert!(
+            !phone
+                .handle_frame(&directed)
+                .iter()
+                .any(|event| matches!(event, MeshEvent::CarriedEvent { .. }))
+        );
+    }
+
+    #[test]
+    fn a_gateways_announcement_reaches_everyone() {
+        let gateway = MeshService::new([21; 32], [22; 32], "laptop");
+        let mut phone = MeshService::new([11; 32], [12; 32], "phone");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        let carried = Carrier::new(Direction::FromGateway, "9q", &json).unwrap();
+        let frame = gateway.carrier_frame(&carried, None).unwrap();
+
+        let seen = phone.handle_frame(&frame);
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            MeshEvent::CarriedEvent {
+                direction: Direction::FromGateway,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn bridge_traffic_is_recognised_and_left_alone() {
+        // We do not bridge islands. Naming the directions means this is dropped
+        // as "not ours" rather than counted as a malformed carrier, which is the
+        // difference between a quiet log and a noisy one.
+        let island = MeshService::new([21; 32], [22; 32], "island");
+        let mut us = MeshService::new([11; 32], [12; 32], "us");
+        let json = serde_json::to_string(&signed_event()).unwrap();
+
+        for direction in [Direction::ToBridge, Direction::FromBridge] {
+            let carried = Carrier::new(direction, "9q", &json).unwrap();
+            let frame = island.carrier_frame(&carried, Some(&us.my_peer_id)).unwrap();
+            assert!(
+                !us.handle_frame(&frame)
+                    .iter()
+                    .any(|event| matches!(event, MeshEvent::CarriedEvent { .. })),
+                "{direction:?} is not ours to act on"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_carrier_is_not_fatal() {
+        let mut us = MeshService::new([11; 32], [12; 32], "us");
+        let packet = Packet::new(
+            MessageType::NostrCarrier,
+            peer_id_to_bytes("aa11bb22cc33dd44"),
+            vec![0xFF; 24],
+            7,
+        )
+        .with_recipient(peer_id_to_bytes(&us.my_peer_id));
+        let frame = packet.encode().unwrap();
+        assert!(!us
+            .handle_frame(&frame)
+            .iter()
+            .any(|event| matches!(event, MeshEvent::CarriedEvent { .. })));
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn a_gateway_announces_itself_and_the_peer_hears_it() {
+        let mut carrier = MeshService::new([11; 32], [12; 32], "carrier");
+        let mut phone = MeshService::new([21; 32], [22; 32], "phone");
+        carrier.gateway_ready = true;
+
+        phone.handle_frame(&carrier.announce_frame().unwrap());
+        let seen = phone.peers.get(&carrier.my_peer_id).expect("announce accepted");
+        assert!(seen.is_gateway(), "the phone can see the offer");
+        assert!(seen.verified, "and the announce still verified with the extra TLV");
+    }
+
+    #[test]
+    fn withdrawing_the_offer_is_heard_too() {
+        // The failure this prevents: a peer keeps depositing traffic with a
+        // gateway that stopped carrying it, because we held the first value we
+        // saw instead of the latest.
+        let mut carrier = MeshService::new([11; 32], [12; 32], "carrier");
+        let mut phone = MeshService::new([21; 32], [22; 32], "phone");
+
+        carrier.gateway_ready = true;
+        phone.handle_frame(&carrier.announce_frame().unwrap());
+        assert!(phone.peers[&carrier.my_peer_id].is_gateway());
+
+        carrier.gateway_ready = false;
+        phone.handle_frame(&carrier.announce_frame().unwrap());
+        assert!(
+            !phone.peers[&carrier.my_peer_id].is_gateway(),
+            "the withdrawal must land, not be ignored as a duplicate announce"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_the_gateway_bit_is_not_a_gateway() {
+        let mut plain = MeshService::new([11; 32], [12; 32], "plain");
+        let mut phone = MeshService::new([21; 32], [22; 32], "phone");
+        phone.handle_frame(&plain.announce_frame().unwrap());
+
+        let seen = &phone.peers[&plain.my_peer_id];
+        assert!(!seen.is_gateway());
+        assert_eq!(
+            seen.capabilities,
+            Some(crate::announce::Capabilities::from_bits(
+                crate::announce::ADVERTISED
+            )),
+            "the set is present, saying private media and nothing about gateways"
+        );
+    }
+
+    #[test]
+    fn we_do_not_claim_gateway_until_we_can_keep_the_promise() {
+        // Advertising it by default would be a promise acted on by every
+        // mesh-only peer in range and kept by none of them.
+        let mut fresh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(!fresh.gateway_ready, "off until the client says otherwise");
+        let announced = crate::announce::Announcement::decode(
+            &crate::protocol::Packet::decode(&fresh.announce_frame().unwrap())
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert!(!announced
+            .advertised()
+            .unwrap()
+            .has(crate::announce::Capabilities::GATEWAY));
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use crate::verification;
+
+    /// The initiator's half, which the client does not implement: a peer
+    /// checking us sends this, so answering it correctly is what is under test.
+    fn challenge_frame(
+        asker: &mut MeshService,
+        target: &str,
+        noise_key_hex: &str,
+        nonce: &[u8],
+    ) -> Vec<u8> {
+        let body = verification::challenge(noise_key_hex, nonce);
+        let payload = NoisePayload::new(NoisePayloadType::VerifyChallenge, body).encode();
+        let sealed = asker.sessions.encrypt(&payload, target).expect("a session");
+        asker
+            .noise_frame(MessageType::NoiseEncrypted, target, sealed)
+            .expect("a frame")
+    }
+
+    /// Pulls the response out of whatever the answering side put on the air.
+    fn opened_response(
+        asker: &mut MeshService,
+        from: &str,
+        events: Vec<MeshEvent>,
+    ) -> Option<(String, Vec<u8>, Vec<u8>)> {
+        for event in events {
+            let MeshEvent::Send(frame) = event else {
+                continue;
+            };
+            let packet = Packet::decode(&frame)?;
+            let plain = asker.sessions.decrypt(&packet.payload, from).ok()?;
+            let payload = NoisePayload::decode(&plain)?;
+            if payload.kind == NoisePayloadType::VerifyResponse {
+                return verification::parse_response(&payload.body);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_challenge_about_our_key_is_answered_provably() {
+        // A phone verifying us sends this. If we cannot answer, verification
+        // fails at their end and there is nothing on ours to notice it.
+        let (mut alice, mut bob, alice_id, bob_id) = super::receipt_tests::established();
+        let bob_key = hex::encode(bob.noise_public_key);
+        let nonce = [0x5A; verification::NONCE_BYTES];
+
+        let frame = challenge_frame(&mut alice, &bob_id, &bob_key, &nonce);
+        let answered = bob.handle_frame(&frame);
+        let (key, echoed, signature) =
+            opened_response(&mut alice, &bob_id, answered).expect("bob answers");
+
+        assert_eq!(key, bob_key, "the answer is about the key that was asked");
+        assert!(
+            verification::verify_response(
+                &bob_key,
+                &nonce,
+                &echoed,
+                &signature,
+                &hex::encode(bob.signing_key.verifying_key().to_bytes())
+            ),
+            "and it is signed by the key bob announces"
+        );
+        let _ = alice_id;
+    }
+
+    #[test]
+    fn a_challenge_naming_someone_elses_key_is_refused() {
+        // Otherwise a peer collects our signature over a claim about a third
+        // party, which is exactly the material needed to impersonate them.
+        let (mut alice, mut bob, _, bob_id) = super::receipt_tests::established();
+        let nonce = [0x5A; verification::NONCE_BYTES];
+        let stranger = hex::encode([0xEE; 32]);
+
+        let frame = challenge_frame(&mut alice, &bob_id, &stranger, &nonce);
+        let answered = bob.handle_frame(&frame);
+        assert!(
+            opened_response(&mut alice, &bob_id, answered).is_none(),
+            "bob must not sign a statement about a key that is not his"
+        );
+    }
+
+    #[test]
+    fn verification_survives_a_restart() {
+        // The only trust here not derived from the air, and the only kind that
+        // costs a walk across town to rebuild.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let fingerprint = "aa11bb22cc33dd44ee55";
+        mesh.mark_verified(fingerprint);
+        assert!(mesh.is_verified(fingerprint));
+        assert!(mesh.is_verified("aa11bb22cc33dd44"), "a peer ID resolves too");
+
+        let saved = mesh.verified_fingerprints();
+        let mut restarted = MeshService::new([1; 32], [2; 32], "me");
+        assert!(!restarted.is_verified(fingerprint));
+        restarted.load_verified(saved);
+        assert!(restarted.is_verified(fingerprint));
+    }
+
+    #[test]
+    fn a_card_names_the_fingerprint_the_client_marks() {
+        // If these ever disagreed, /verify would mark something nobody is.
+        let mesh = MeshService::new([1; 32], [2; 32], "me");
+        let card = mesh.verification_card(None, 1_700_000_000, [0; verification::NONCE_BYTES]);
+        assert_eq!(card.check(1_700_000_000), Ok(()));
+        assert_eq!(card.fingerprint().unwrap(), mesh.my_fingerprint());
+        assert_eq!(card.peer_id().unwrap(), mesh.my_peer_id);
+        assert_eq!(card.nickname, "me");
+    }
+}
+
+#[cfg(test)]
+mod addressing_tests {
+    use super::*;
+
+    #[test]
+    fn a_favourite_can_be_addressed_after_they_go_out_of_range() {
+        // The case the internet transport exists for. Before this, /dm to an
+        // absent peer answered "nobody here is called bob" — so the fallback
+        // path could never be reached at all.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        let fingerprint = "aa11bb22cc33dd44ee55";
+        mesh.favorites.apply_notice(
+            fingerprint,
+            "bob",
+            &crate::favorites::FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1bob".into()),
+            },
+        );
+        assert!(
+            mesh.peers.is_empty(),
+            "nobody is in range; this is the whole point"
+        );
+
+        let target = mesh
+            .addressable_peer_id_for("bob")
+            .expect("a favourite is addressable without being present");
+        assert_eq!(target, "aa11bb22cc33dd44", "the peer ID prefixes the fingerprint");
+        assert_eq!(mesh.nostr_address_for(&target), Some("npub1bob"));
+    }
+
+    #[test]
+    fn a_present_peer_is_preferred_over_a_stored_one() {
+        let mut alice = MeshService::new([11; 32], [12; 32], "alice");
+        let mut bob = MeshService::new([21; 32], [22; 32], "bob");
+        alice.handle_frame(&bob.announce_frame().unwrap());
+        let live = bob.my_peer_id.clone();
+
+        // A stale favourite under the same nickname must not shadow the peer
+        // who is actually here.
+        alice.favorites.apply_notice(
+            "ffffffffffffffffffff",
+            "bob",
+            &crate::favorites::FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1stale".into()),
+            },
+        );
+        assert_eq!(alice.addressable_peer_id_for("bob").unwrap(), live);
+    }
+
+    #[test]
+    fn an_unknown_name_is_still_an_error() {
+        let mesh = MeshService::new([1; 32], [2; 32], "me");
+        assert!(mesh.addressable_peer_id_for("nobody").is_err());
+        assert!(mesh.nostr_address_for("aa11bb22cc33dd44").is_none());
+    }
+
+    #[test]
+    fn a_favourite_without_an_address_has_no_internet_route() {
+        // We favourited them, so they can reach us; they never favourited us,
+        // so we have nothing to send to. Addressable by name, not by relay.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        mesh.favorites.set_ours("aa11bb22cc33dd44ee55", "carol", true);
+        let target = mesh.addressable_peer_id_for("carol").unwrap();
+        assert!(
+            mesh.nostr_address_for(&target).is_none(),
+            "no address means the message waits, not that it is sent nowhere"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wipe_favorites_tests {
+    use super::*;
+
+    #[test]
+    fn a_wipe_destroys_the_contact_list_too() {
+        // Favourites are addresses and relationships; leaving them behind
+        // would leave exactly the record a wipe exists to remove.
+        let mut mesh = MeshService::new([1; 32], [2; 32], "me");
+        mesh.favorites.apply_notice(
+            "aa11",
+            "bob",
+            &FavoriteNotice {
+                is_favorite: true,
+                their_nostr_key: Some("npub1bob".into()),
+            },
+        );
+        assert!(mesh.favorites.get("aa11").is_some());
+
+        mesh.wipe();
+        assert!(mesh.favorites.get("aa11").is_none());
+        assert!(mesh.favorites.ours().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gossip_sync_tests {
+    use super::*;
+    use crate::sync::gcs::build_filter;
+    use crate::sync::packet_id::{packet_id, PACKET_ID_LEN};
+    use crate::sync::rate_limit::MAX_RESPONSES;
+    use crate::sync::request::RequestSync;
+    use crate::sync::type_flags::SyncTypeFlags;
+
+    fn pair() -> (MeshService, MeshService) {
+        (
+            MeshService::new([11; 32], [12; 32], "alice"),
+            MeshService::new([21; 32], [22; 32], "bob"),
+        )
+    }
+
+    /// Everything `handle_frame` wants sent back to the peer that asked.
+    fn replies(events: Vec<MeshEvent>) -> Vec<Packet> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                MeshEvent::Reply(frame) => Packet::decode(&frame),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notices(events: &[MeshEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                MeshEvent::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A sync request frame from `asker`, whose filter claims exactly `held`.
+    fn request_frame(
+        asker: &MeshService,
+        held: &[Packet],
+        types: Option<SyncTypeFlags>,
+    ) -> Vec<u8> {
+        let ids: Vec<[u8; PACKET_ID_LEN]> = held.iter().map(packet_id).collect();
+        let params = build_filter(&ids, 400, 0.01);
+        let request = RequestSync {
+            p: params.p,
+            m: params.m,
+            data: params.data,
+            types,
+            since_timestamp: None,
+            fragment_id_filter: None,
+        };
+        Packet::new(
+            MessageType::RequestSync,
+            peer_id_to_bytes(&asker.my_peer_id),
+            request.encode(),
+            // Local-only, exactly as upstream sends it.
+            0,
+        )
+        .encode()
+        .expect("a sync request encodes")
+    }
+
+    /// Alice hears an announce and a public message from Bob, both accepted.
+    fn alice_hearing_bob() -> (MeshService, MeshService, Vec<Vec<u8>>) {
+        let (mut alice, mut bob) = pair();
+        let mut heard = Vec::new();
+        let announce = bob.announce_frame().expect("bob announces");
+        alice.handle_frame(&announce);
+        heard.push(announce);
+        for frame in bob.public_message_frames("hello the room") {
+            alice.handle_frame(&frame);
+            heard.push(frame);
+        }
+        (alice, bob, heard)
+    }
+
+    #[test]
+    fn a_request_from_a_peer_holding_nothing_is_answered_with_what_we_heard() {
+        // The whole point of the feature: before this, a request reached
+        // `Some(_) => Vec::new()` and the asker got silence.
+        let (mut alice, bob, _) = alice_hearing_bob();
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], None)));
+
+        assert!(!sent.is_empty(), "alice must answer a sync request");
+        let bodies: Vec<Vec<u8>> = sent.iter().map(|p| p.payload.clone()).collect();
+        assert!(
+            bodies.iter().any(|b| b == b"hello the room"),
+            "the message alice heard should come back, got {bodies:?}"
+        );
+        assert!(
+            sent.iter().any(|p| p.parsed_type() == Some(MessageType::Announce)),
+            "and bob's announce, which carries the key to verify the rest"
+        );
+    }
+
+    #[test]
+    fn every_answer_is_solicited_and_goes_no_further() {
+        let (mut alice, bob, _) = alice_hearing_bob();
+        for reply in replies(alice.handle_frame(&request_frame(&bob, &[], None))) {
+            assert_eq!(reply.ttl, 0, "a reply must not be relayed onward");
+            assert!(reply.is_rsr, "and must be marked solicited");
+        }
+    }
+
+    #[test]
+    fn a_peer_that_already_holds_everything_is_sent_nothing() {
+        // The property that keeps this from flooding the mesh every fifteen
+        // seconds: a request naming what it has produces an empty answer.
+        let (mut alice, bob, heard) = alice_hearing_bob();
+        let held: Vec<Packet> = heard.iter().filter_map(|f| Packet::decode(f)).collect();
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &held, None)));
+        assert!(sent.is_empty(), "nothing new to say, so say nothing");
+    }
+
+    #[test]
+    fn a_message_we_refused_to_show_is_never_handed_on() {
+        // The laundering guard. A message claiming to be from a peer we know,
+        // with a signature that does not match, is dropped by
+        // `handle_public_message` — and must not enter the archive either, or
+        // we would re-serve to the room something we would not show our own
+        // user.
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+
+        let frame = bob
+            .public_message_frames("honest words")
+            .pop()
+            .expect("one frame");
+        let mut forged = Packet::decode(&frame).expect("decodes");
+        forged.payload = b"words bob never said".to_vec();
+        let forged_frame = forged.encode().expect("re-encodes");
+
+        let events = alice.handle_frame(&forged_frame);
+        assert!(
+            notices(&events).iter().any(|n| n.contains("bad signature")),
+            "alice should reject it outright, got {:?}",
+            notices(&events)
+        );
+
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], None)));
+        let bodies: Vec<Vec<u8>> = sent.iter().map(|p| p.payload.clone()).collect();
+        assert!(
+            !bodies.iter().any(|b| b == b"words bob never said"),
+            "the forged message must not be in what alice offers, got {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn a_private_message_is_never_offered_to_the_room() {
+        // Sent by a peer alice has heard no announce from, deliberately. With a
+        // known sender the signature check rejects the packet first and the
+        // broadcast guard is never reached, so the test would pass whether or
+        // not that guard existed. With an unknown sender there is no key to
+        // check against, `handle_public_message` accepts it, and the only thing
+        // standing between an addressed message and the room's history is the
+        // guard this test is named for.
+        let (mut alice, bob, _) = alice_hearing_bob();
+        let carol = MeshService::new([31; 32], [32; 32], "carol");
+        let mut addressed = Packet::new(
+            MessageType::Message,
+            peer_id_to_bytes(&carol.my_peer_id),
+            b"just between us".to_vec(),
+            7,
+        );
+        addressed.recipient_id = Some(peer_id_to_bytes(&alice.my_peer_id));
+
+        let events = alice.handle_frame(&addressed.encode().expect("encodes"));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MeshEvent::PublicMessage { .. })),
+            "alice accepts it, which is what makes the guard the only thing left"
+        );
+
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], None)));
+        assert!(
+            !sent.iter().any(|p| p.payload == b"just between us"),
+            "an addressed packet is not public history"
+        );
+    }
+
+    #[test]
+    fn one_peer_asking_in_a_loop_runs_out_of_budget() {
+        let (mut alice, bob, _) = alice_hearing_bob();
+        let frame = request_frame(&bob, &[], None);
+        for i in 0..MAX_RESPONSES {
+            assert!(
+                !replies(alice.handle_frame(&frame)).is_empty(),
+                "request {i} is within budget"
+            );
+        }
+        assert!(
+            replies(alice.handle_frame(&frame)).is_empty(),
+            "past the budget alice stops answering"
+        );
+    }
+
+    #[test]
+    fn a_greedy_peer_does_not_silence_us_towards_anyone_else() {
+        let (mut alice, bob, _) = alice_hearing_bob();
+        let carol = MeshService::new([31; 32], [32; 32], "carol");
+        let greedy = request_frame(&bob, &[], None);
+        for _ in 0..(MAX_RESPONSES * 2) {
+            alice.handle_frame(&greedy);
+        }
+        assert!(
+            !replies(alice.handle_frame(&request_frame(&carol, &[], None))).is_empty(),
+            "carol's budget is her own"
+        );
+    }
+
+    #[test]
+    fn a_malformed_request_is_reported_rather_than_answered() {
+        let (mut alice, bob, _) = alice_hearing_bob();
+        let frame = Packet::new(
+            MessageType::RequestSync,
+            peer_id_to_bytes(&bob.my_peer_id),
+            vec![0xFF; 6],
+            0,
+        )
+        .encode()
+        .expect("encodes");
+
+        let events = alice.handle_frame(&frame);
+        assert!(replies(events.clone()).is_empty());
+        assert!(
+            notices(&events).iter().any(|n| n.contains("malformed sync request")),
+            "got {:?}",
+            notices(&events)
+        );
+    }
+
+    #[test]
+    fn the_pieces_of_a_transfer_are_held_so_a_stalled_peer_can_ask_for_them() {
+        // Fragments are archived in their own branch of the dispatch, which
+        // returns before the type match, so nothing else covers this path.
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        let pieces = bob
+            .file_frames("notes.txt", None, b"a file long enough to split".repeat(20))
+            .expect("bob sends a file");
+        assert!(pieces.len() > 1, "the file must actually fragment");
+        for piece in &pieces {
+            alice.handle_frame(piece);
+        }
+
+        let only_fragments = Some(SyncTypeFlags::from_types(&[MessageType::Fragment]));
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], only_fragments)));
+        assert_eq!(
+            sent.len(),
+            pieces.len(),
+            "alice should offer every piece she holds"
+        );
+        assert!(sent
+            .iter()
+            .all(|p| p.parsed_type() == Some(MessageType::Fragment)));
+    }
+
+    #[test]
+    fn a_file_we_sent_is_offered_whole_rather_than_only_as_pieces() {
+        // The sender files the transfer before splitting it, so a peer asking
+        // for files gets the transfer and a peer asking for fragments gets the
+        // pieces. Without this the sender of a file offers nothing under
+        // `FileTransfer` at all.
+        let (alice, mut bob) = pair();
+        bob.file_frames("notes.txt", None, b"contents".to_vec())
+            .expect("bob sends a file");
+
+        let only_files = Some(SyncTypeFlags::from_types(&[MessageType::FileTransfer]));
+        let sent = replies(bob.handle_frame(&request_frame(&alice, &[], only_files)));
+        assert_eq!(sent.len(), 1, "the whole transfer, once");
+        assert_eq!(sent[0].parsed_type(), Some(MessageType::FileTransfer));
+    }
+
+    #[test]
+    fn a_file_we_received_is_offered_on_after_it_is_whole() {
+        // The receiving side files the transfer once reassembly finishes and
+        // `handle_file` has accepted it, which is a different call site from
+        // the sender's and from the fragment branch's.
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        let pieces = bob
+            .file_frames("small.txt", None, b"fits in one piece".to_vec())
+            .expect("bob sends a file");
+        for piece in &pieces {
+            alice.handle_frame(piece);
+        }
+
+        let only_files = Some(SyncTypeFlags::from_types(&[MessageType::FileTransfer]));
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], only_files)));
+        assert_eq!(sent.len(), 1, "alice holds the reassembled transfer");
+        assert_eq!(sent[0].parsed_type(), Some(MessageType::FileTransfer));
+    }
+
+    #[test]
+    fn a_request_naming_only_files_does_not_drag_the_chat_log_along() {
+        let (mut alice, bob, _) = alice_hearing_bob();
+        let only_files = Some(SyncTypeFlags::from_types(&[MessageType::FileTransfer]));
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], only_files)));
+        assert!(sent.is_empty(), "alice heard no files, got {}", sent.len());
+    }
+
+    #[test]
+    fn what_we_said_ourselves_is_part_of_the_history_we_offer() {
+        // `handle_packet` returns early on our own peer ID, so our relayed echo
+        // never files anything. Without archiving at send time a node that
+        // talks would serve everyone else's words and none of its own — and a
+        // node alone in a room would serve nothing at all.
+        let (mut alice, bob) = pair();
+        alice.announce_frame().expect("alice announces");
+        assert!(!alice.public_message_frames("alice was here").is_empty());
+
+        let sent = replies(alice.handle_frame(&request_frame(&bob, &[], None)));
+        let bodies: Vec<Vec<u8>> = sent.iter().map(|p| p.payload.clone()).collect();
+        assert!(
+            bodies.iter().any(|b| b == b"alice was here"),
+            "alice should offer her own message, got {bodies:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|p| p.parsed_type() == Some(MessageType::Announce)),
+            "and her own announce, so bob can verify it"
+        );
+    }
+
+    #[test]
+    fn a_wipe_leaves_nothing_to_offer() {
+        let (mut alice, bob, _) = alice_hearing_bob();
+        assert!(!replies(alice.handle_frame(&request_frame(&bob, &[], None))).is_empty());
+
+        alice.wipe();
+
+        assert!(
+            replies(alice.handle_frame(&request_frame(&bob, &[], None))).is_empty(),
+            "a wipe has to reach the archive; it is a record of who was here"
+        );
+    }
+
+    #[test]
+    fn a_departed_peer_stops_being_announced_on_their_behalf() {
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        assert!(!replies(alice.handle_frame(&request_frame(&bob, &[], None))).is_empty());
+
+        // Age bob out of the registry the way the maintenance tick would.
+        for peer in alice.peers.values_mut() {
+            peer.last_seen = Instant::now() - PEER_RETENTION - Duration::from_secs(1);
+        }
+        alice.prune_peers();
+
+        assert!(
+            replies(alice.handle_frame(&request_frame(&bob, &[], None))).is_empty(),
+            "once we stop believing bob is here, we stop telling the room he is"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gossip_sync_hardening_tests {
+    //! The findings from the review of PR #17, each with the test that would
+    //! have caught it. Kept together because they are one story: the responder
+    //! answered questions it should have refused, and paid for frames it never
+    //! answered.
+
+    use super::*;
+    use crate::relay;
+    use crate::sync::gcs::build_filter;
+    use crate::sync::packet_id::{packet_id, PACKET_ID_LEN};
+    use crate::sync::rate_limit::MAX_RESPONSES;
+    use crate::sync::request::RequestSync;
+    use crate::sync::responder::MAX_REPLIES_PER_ROUND;
+
+    fn pair() -> (MeshService, MeshService) {
+        (
+            MeshService::new([11; 32], [12; 32], "alice"),
+            MeshService::new([21; 32], [22; 32], "bob"),
+        )
+    }
+
+    fn replies(events: Vec<MeshEvent>) -> Vec<Packet> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                MeshEvent::Reply(frame) => Packet::decode(&frame),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A sync request frame from `asker`, at a chosen hop count.
+    fn request_frame_ttl(asker: &MeshService, held: &[Packet], ttl: u8) -> Vec<u8> {
+        let ids: Vec<[u8; PACKET_ID_LEN]> = held.iter().map(packet_id).collect();
+        let params = build_filter(&ids, 400, 0.01);
+        let request = RequestSync {
+            p: params.p,
+            m: params.m,
+            data: params.data,
+            types: None,
+            since_timestamp: None,
+            fragment_id_filter: None,
+        };
+        Packet::new(
+            MessageType::RequestSync,
+            peer_id_to_bytes(&asker.my_peer_id),
+            request.encode(),
+            ttl,
+        )
+        .encode()
+        .expect("a sync request encodes")
+    }
+
+    fn alice_hearing_bob() -> (MeshService, MeshService) {
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        for frame in bob.public_message_frames("hello the room") {
+            alice.handle_frame(&frame);
+        }
+        (alice, bob)
+    }
+
+    #[test]
+    fn a_sync_request_is_never_carried_onward() {
+        // Upstream refuses this before it looks at the hop count at all
+        // (`RelayController.decide`: "never relay it, even when a peer crafts
+        // one with TTL headroom to turn every reachable node into a
+        // responder"). One crafted frame would otherwise reach every node in
+        // the mesh and make each of them replay its whole archive.
+        let links = vec!["a".to_string(), "b".to_string()];
+        for ttl in [2u8, 3, 7] {
+            let request = Packet::new(MessageType::RequestSync, [9; 8], vec![0u8; 4], ttl);
+            assert_eq!(
+                relay::plan(&request, &links, "a", "aaaaaaaaaaaaaaaa"),
+                relay::Relay::Suppress("a sync request does not leave its link"),
+                "a request with {ttl} hops left must still not be carried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_request_that_has_travelled_is_not_answered() {
+        // The reply is routed back down the link the request arrived on, which
+        // is only the peer that asked while the request has taken no hops. A
+        // relayed request answered down the ingress link sends a stranger's
+        // history to the wrong peer and leaves the asker with nothing.
+        let (mut alice, bob) = alice_hearing_bob();
+
+        assert!(
+            !replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0))).is_empty(),
+            "a request with no hops left is the one we answer"
+        );
+        for ttl in [1u8, 2, 7] {
+            assert!(
+                replies(alice.handle_frame(&request_frame_ttl(&bob, &[], ttl))).is_empty(),
+                "a request carrying {ttl} hop(s) must go unanswered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_we_refuse_to_answer_does_not_spend_the_asker_s_budget() {
+        // The limiter's own documentation says the refusal is the answer, so a
+        // caller must not take a slot and then decline to use it. Eight
+        // malformed frames carrying bob's peer ID used to silence us towards
+        // bob for the whole window — and nothing authenticates that ID, so the
+        // sender chooses whom to silence.
+        let (mut alice, bob) = alice_hearing_bob();
+
+        let spoofed = Packet::new(
+            MessageType::RequestSync,
+            peer_id_to_bytes(&bob.my_peer_id),
+            vec![0xFF; 6], // will not parse
+            0,
+        )
+        .encode()
+        .expect("encodes");
+
+        for _ in 0..(MAX_RESPONSES * 2) {
+            alice.handle_frame(&spoofed);
+        }
+
+        assert!(
+            !replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0))).is_empty(),
+            "bob's own request must still be answered"
+        );
+    }
+
+    #[test]
+    fn a_request_with_hops_on_it_does_not_spend_a_budget_either() {
+        let (mut alice, bob) = alice_hearing_bob();
+        for _ in 0..(MAX_RESPONSES * 2) {
+            alice.handle_frame(&request_frame_ttl(&bob, &[], 7));
+        }
+        assert!(
+            !replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0))).is_empty(),
+            "refusing on hop count must not charge for the refusal"
+        );
+    }
+
+    #[test]
+    fn a_full_archive_answers_within_the_links_capacity() {
+        // End to end through the dispatch, not just through `respond`: the
+        // headline case is somebody arriving and asking for everything, and
+        // that was the case that overflowed a 64-deep queue and lost most of
+        // its own answer without saying so.
+        let (mut alice, mut bob) = pair();
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        for i in 0..(MAX_REPLIES_PER_ROUND * 3) {
+            for frame in alice.public_message_frames(&format!("message number {i}")) {
+                let _ = frame;
+            }
+        }
+
+        let sent = replies(alice.handle_frame(&request_frame_ttl(&bob, &[], 0)));
+        assert!(
+            sent.len() <= MAX_REPLIES_PER_ROUND,
+            "one round produced {} frames into a {}-deep queue",
+            sent.len(),
+            crate::transport::LINK_INBOX_DEPTH
+        );
+    }
+
+    #[test]
+    fn the_maintenance_sweep_actually_prunes_the_limiter() {
+        // `sweep_sync_state` is the only caller of `prune` in the binary, and
+        // nothing checked that it calls it — the limiter's own test covers the
+        // method, not the wiring.
+        let (mut alice, bob) = alice_hearing_bob();
+        alice.handle_frame(&request_frame_ttl(&bob, &[], 0));
+        assert_eq!(alice.sync_limiter.tracked_peers(), 1);
+
+        let now = now_millis();
+        alice.sweep_sync_state_at(now);
+        assert_eq!(
+            alice.sync_limiter.tracked_peers(),
+            1,
+            "still inside the window"
+        );
+
+        // Past the window it must actually be forgotten. Without this the test
+        // holds whether or not the sweep calls `prune` at all — which is
+        // precisely how the wiring went unchecked in the first place.
+        alice.sweep_sync_state_at(now + crate::sync::rate_limit::WINDOW_MS + 1);
+        assert_eq!(alice.sync_limiter.tracked_peers(), 0);
+    }
+
+    #[test]
+    fn the_maintenance_sweep_actually_reclaims_the_archive() {
+        // The other half of the same wiring, and the same trap: `drop_stale`
+        // has its own test, but nothing showed the sweep reaching it.
+        let (mut alice, _bob) = alice_hearing_bob();
+        assert!(alice.archive.len(crate::sync::archive::Kind::Message) > 0);
+
+        let now = now_millis();
+        alice.sweep_sync_state_at(now);
+        assert!(
+            alice.archive.len(crate::sync::archive::Kind::Message) > 0,
+            "still inside the window"
+        );
+
+        alice.sweep_sync_state_at(now + crate::sync::archive::MAX_AGE_MS + 1);
+        assert_eq!(alice.archive.len(crate::sync::archive::Kind::Message), 0);
+    }
+
+    #[test]
+    fn a_peer_who_never_heard_the_original_can_read_what_we_send_back() {
+        // Every other test in this feature stops at "we produced the right
+        // bytes". This is the only one that would fail if the reply were
+        // unusable, which is the failure mode this repo keeps hitting: carol
+        // has never heard bob, and learns both who he is and what he said
+        // entirely from alice's answer.
+        let (mut alice, mut bob) = pair();
+        let mut carol = MeshService::new([31; 32], [32; 32], "carol");
+        alice.handle_frame(&bob.announce_frame().expect("bob announces"));
+        for frame in bob.public_message_frames("hello the room") {
+            alice.handle_frame(&frame);
+        }
+
+        let sent = replies(alice.handle_frame(&request_frame_ttl(&carol, &[], 0)));
+        assert!(!sent.is_empty());
+
+        let mut saw_bob = false;
+        let mut saw_message = false;
+        for reply in &sent {
+            let frame = reply.encode().expect("a reply re-encodes");
+            for event in carol.handle_frame(&frame) {
+                match event {
+                    MeshEvent::PeerAppeared { nickname, .. } if nickname == "bob" => {
+                        saw_bob = true;
+                    }
+                    MeshEvent::PublicMessage { content, sender, .. } => {
+                        assert_eq!(sender, "bob", "attributed to its author, not to alice");
+                        assert_eq!(content, "hello the room");
+                        saw_message = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_bob, "carol learns bob exists from the relayed announce");
+        assert!(saw_message, "and reads the message he sent before she arrived");
+    }
+}
+
+#[cfg(test)]
+mod private_file_tests {
+    use super::*;
+    use super::receipt_tests::established;
+
+    #[test]
+    fn a_private_file_reaches_only_its_recipient_and_is_flagged_private() {
+        let (mut alice, mut bob, _, bob_id) = established();
+        let mut carol = MeshService::new([31; 32], [32; 32], "carol");
+        let original: Vec<u8> = (0..20_000u32).map(|i| (i % 253) as u8).collect();
+        let frames = alice
+            .private_file_frames(&bob_id, "pic.png", Some("image/png".into()), original.clone())
+            .unwrap();
+        assert!(frames.len() > 1 && frames.len() <= PRIVATE_FILE_MAX_FRAGMENTS);
+        let mut got = None;
+        for frame in &frames {
+            for event in bob.handle_frame(frame) {
+                if let MeshEvent::FileReceived { name, bytes, private, .. } = event {
+                    got = Some((name, bytes, private));
+                }
+            }
+            for event in carol.handle_frame(frame) {
+                assert!(!matches!(event, MeshEvent::FileReceived { .. }), "a bystander must not get the file");
+            }
+        }
+        let (name, bytes, private) = got.expect("bob receives the file");
+        assert_eq!(name, "pic.png");
+        assert_eq!(bytes, original);
+        assert!(private);
+    }
+
+    #[test]
+    fn private_files_need_a_session_and_respect_the_phone_fragment_cap() {
+        let mut alice = MeshService::new([1; 32], [2; 32], "alice");
+        assert!(alice.private_file_frames("00000000000000aa", "a.txt", None, vec![1; 10]).is_err());
+        let (mut alice, _bob, _, bob_id) = established();
+        let too_big = vec![0u8; PRIVATE_FILE_MAX_BYTES + 1];
+        assert!(alice.private_file_frames(&bob_id, "big.bin", None, too_big).unwrap_err().contains("too big"));
+        // A refused file must not have advanced the session: a DM still decrypts.
+        assert!(alice.private_file_frames(&bob_id, "ok.txt", None, vec![1; 100]).is_ok());
+    }
+
+    #[test]
+    fn private_file_limit_is_the_fragment_budget_less_worst_case_metadata() {
+        assert_eq!(PRIVATE_FILE_MAX_FRAGMENTS, 256);
+        assert_eq!(fragment::SLICE_BYTES, 213);
+        // 256 * 213 = 54,528 bytes of reassembled packet. A worst-case file
+        // spends 340 bytes on framing plus a 255-byte name and a 16-byte MIME
+        // type (69 + 255 + 16), leaving 54,528 - 340 = 54,188 for content.
+        assert_eq!(PRIVATE_FILE_WIRE_OVERHEAD, 69);
+        assert_eq!(
+            PRIVATE_FILE_MAX_BYTES,
+            PRIVATE_FILE_MAX_FRAGMENTS * fragment::SLICE_BYTES
+                - PRIVATE_FILE_WIRE_OVERHEAD
+                - PRIVATE_FILE_MAX_NAME_BYTES
+                - PRIVATE_FILE_MAX_MIME_BYTES
+        );
+        assert_eq!(PRIVATE_FILE_MAX_BYTES, 54_188);
+    }
+
+    #[test]
+    fn a_file_at_the_private_limit_sends_and_one_byte_more_is_refused() {
+        let (mut alice, _bob, _, bob_id) = established();
+        // Worst-case metadata: a 255-byte name and a 16-byte MIME type.
+        let name = "n".repeat(255);
+        let at_limit = vec![0u8; PRIVATE_FILE_MAX_BYTES];
+        let frames = alice
+            .private_file_frames(&bob_id, &name, Some("application/json".into()), at_limit)
+            .expect("a file at the advertised limit must fit");
+        assert_eq!(frames.len(), PRIVATE_FILE_MAX_FRAGMENTS);
+
+        let over = vec![0u8; PRIVATE_FILE_MAX_BYTES + 1];
+        let error = alice
+            .private_file_frames(&bob_id, "big.bin", None, over)
+            .unwrap_err();
+        assert!(error.contains("private-transfer limit"), "got: {error}");
+        assert!(error.contains("54188"), "got: {error}");
+        assert!(error.contains("52.9"), "got: {error}");
+    }
+
+    #[test]
+    fn a_broadcast_file_is_not_flagged_private() {
+        let mut alice = MeshService::new([1; 32], [2; 32], "alice");
+        let mut bob = MeshService::new([3; 32], [4; 32], "bob");
+        for f in alice.file_frames("a.txt", None, vec![5; 50]).unwrap() {
+            for ev in bob.handle_frame(&f) {
+                if let MeshEvent::FileReceived { private, .. } = ev { assert!(!private); }
+            }
+        }
+    }
+
+    #[test]
+    fn a_prerelease_ios_private_file_payload_is_delivered_as_a_file() {
+        // Prerelease iOS wrapped the same file TLV in Noise payload 0x09. We
+        // never emit that value, but a phone still using it must be understood.
+        let (mut alice, mut bob, alice_id, bob_id) = established();
+        let content = b"bytes from an older phone".to_vec();
+        let file = FilePacket {
+            file_name: Some("photo.png".into()),
+            file_size: Some(content.len() as u64),
+            mime_type: Some("image/png".into()),
+            content: content.clone(),
+        };
+        let mut payload = NoisePayload::new(
+            NoisePayloadType::PrivateFile,
+            file.encode().expect("file encodes"),
+        )
+        .encode();
+        payload[0] = 0x09;
+        let sealed = alice
+            .sessions
+            .encrypt(&payload, &bob_id)
+            .expect("session encrypts");
+        let frame = Packet::new(
+            MessageType::NoiseEncrypted,
+            peer_id_to_bytes(&alice_id),
+            sealed,
+            MESSAGE_TTL,
+        )
+        .with_recipient(peer_id_to_bytes(&bob_id))
+        .encode()
+        .expect("frame encodes");
+
+        let events = bob.handle_frame(&frame);
+        let received = events
+            .into_iter()
+            .find_map(|event| match event {
+                MeshEvent::FileReceived {
+                    peer_id,
+                    name,
+                    bytes,
+                    private,
+                    ..
+                } => Some((peer_id, name, bytes, private)),
+                _ => None,
+            })
+            .expect("the 0x09 payload is delivered as a file");
+        assert_eq!(received.0, alice_id);
+        assert_eq!(received.1, "photo.png");
+        assert_eq!(received.2, content);
+        assert!(received.3);
+    }
+}

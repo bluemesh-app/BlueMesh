@@ -1,3 +1,8 @@
-backend/
+backend/target/
 shots/
 __pycache__/
+
+# Flatpak build state and agent handoff notes
+.flatpak-builder/
+flatpak-build/
+.handoff-*.md

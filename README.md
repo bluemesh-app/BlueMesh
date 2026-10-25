@@ -18,9 +18,14 @@ and they starred you back). Open their chat and use the paperclip or the ⋮ men
 * Sent **only to that person**, sealed inside your Noise session, using the same
   wire format as BitChat Android's private media (Noise payload `0x20`, file TLV,
   fragments addressed to the recipient). Relays only see ciphertext.
+* BlueMesh advertises the private-media capability (bit 8) and proves it with an
+  authenticated peer-state payload (Noise `0x21`) right after each handshake, so
+  Android offers encrypted file transfer instead of asking to send without E2E
+  encryption.
 * An encrypted session must be up first (send them a message).
-* Limit about **53 KiB** per private file: Android refuses to reassemble more than
-  256 fragments and BlueMesh sends 213-byte fragments. Bigger files are refused
+* Limit **52.9 KiB (54,188 bytes)** per private file: Android refuses to reassemble
+  more than 256 fragments and BlueMesh sends 213-byte fragments. That budget also
+  carries the file name, type and encryption overhead. Bigger files are refused
   with a message rather than lost on the phone.
 * **No broadcast files.** Sending a file to everyone in range is switched off;
   `send_file` without a `peer_id` is refused by the backend.

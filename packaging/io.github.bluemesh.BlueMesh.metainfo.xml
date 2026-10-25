@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata skeleton for BlueMesh.
+
+  TODO(Dyl): before any Flathub submission, replace the placeholder app id
+  io.github.bluemesh.BlueMesh with the real id derived from the project's
+  GitHub account (for example io.github.<account>.BlueMesh), and rename this
+  file, the desktop file, the Flatpak manifest and the installed icon to match.
+
+  TODO: replace the placeholder homepage/bugtracker/donation URLs below.
+  The donation URL is deliberately an example.org placeholder. Do not put a
+  live Polar/Lemon checkout URL here until Dyl supplies one.
+-->
+<component type="desktop-application">
+  <id>io.github.bluemesh.BlueMesh</id>
+  <name>BlueMesh</name>
+  <summary>Off-grid Bluetooth mesh chat for nearby devices</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      BlueMesh is an off-grid chat app for Linux. It talks to nearby devices
+      over a Bluetooth Low Energy mesh, so no internet connection, account or
+      phone number is needed for mesh chat. It speaks the open BitChat mesh wire
+      protocol and can chat with BitChat-compatible devices nearby.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Public mesh chat with people in range</li>
+      <li>End-to-end encrypted direct messages (Noise XX)</li>
+      <li>Private file transfer to accepted contacts, with image preview</li>
+      <li>Favourites, block list and emergency wipe</li>
+      <li>Optional geohash location channels carried over Nostr relays</li>
+    </ul>
+    <p>
+      Location channels use the internet and are public. Bluetooth mesh chat
+      itself works without internet access.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.bluemesh.BlueMesh.desktop</launchable>
+
+  <!-- TODO: replace with the real project GitHub URLs. -->
+  <url type="homepage">https://github.com/YOUR-GITHUB-ACCOUNT/BlueMesh</url>
+  <url type="bugtracker">https://github.com/YOUR-GITHUB-ACCOUNT/BlueMesh/issues</url>
+
+  <!-- TODO(Dyl): replace this clear placeholder with the real tip URL. -->
+  <url type="donation">https://example.org/TODO-tip-url</url>
+
+  <developer id="io.github.bluemesh">
+    <name>BlueMesh contributors</name>
+  </developer>
+
+  <categories>
+    <category>Network</category>
+    <category>Chat</category>
+    <category>InstantMessaging</category>
+  </categories>
+
+  <keywords>
+    <keyword>bluemesh</keyword>
+    <keyword>bluetooth</keyword>
+    <keyword>mesh</keyword>
+    <keyword>chat</keyword>
+    <keyword>offline</keyword>
+    <keyword>nostr</keyword>
+  </keywords>
+
+  <!-- TODO: add screenshots before a Flathub submission. -->
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-25">
+      <description>
+        <p>Initial Flatpak and AppStream packaging skeleton.</p>
+      </description>
+    </release>
+  </releases>
+</component>

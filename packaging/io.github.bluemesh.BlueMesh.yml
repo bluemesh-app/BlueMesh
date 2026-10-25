@@ -1,0 +1,89 @@
+# Flatpak manifest skeleton for BlueMesh. NOT submitted to Flathub.
+#
+# TODO(Dyl) before a real build/submission:
+#   1. Replace the placeholder app id io.github.bluemesh.BlueMesh (here, in the
+#      metainfo/desktop filenames, wrapper name and installed icon paths) with
+#      the real id derived from the project's GitHub account.
+#   2. Replace the placeholder URLs in the metainfo file, including the
+#      example.org tip URL. Do not use a live Polar/Lemon checkout yet.
+#   3. Replace the local "dir" source below with a pinned git source (URL,
+#      tag and commit) once the release tag exists.
+#
+# Done: gui/bluemesh.py APP_ID and the desktop StartupWMClass now use
+# io.github.bluemesh.BlueMesh. The crate sources are generated in
+# packaging/cargo-sources.json and included below.
+#
+# Runtime note: org.gnome.Platform already provides Python 3, PyGObject,
+# GTK 4 and libadwaita; the GUI needs no vendored Python packages.
+
+id: io.github.bluemesh.BlueMesh
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: io.github.bluemesh.BlueMesh
+
+finish-args:
+  # Nostr location channels, and Bluetooth also needs network access in Flatpak.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+
+  # BLE scanning/advertising: AF_BLUETOOTH sockets plus BlueZ on the system bus.
+  - --allow=bluetooth
+  - --system-talk-name=org.bluez
+
+  # Desktop notifications. File picker and OpenURI use xdg-desktop-portal, so no
+  # broad home/filesystem permission is requested.
+  - --talk-name=org.freedesktop.Notifications
+
+  - --env=BLUEMESHD=/app/bin/bluemeshd
+
+modules:
+  - name: bluemesh
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/bluemesh/cargo
+    build-commands:
+      - cargo build --release --locked --offline --manifest-path backend/Cargo.toml --bin bluemeshd
+      - install -Dm755 backend/target/release/bluemeshd /app/bin/bluemeshd
+      - install -Dm755 packaging/io.github.bluemesh.BlueMesh.sh /app/bin/io.github.bluemesh.BlueMesh
+      - install -Dm644 gui/bluemesh.py /app/lib/bluemesh/bluemesh.py
+
+      - install -Dm644 packaging/io.github.bluemesh.BlueMesh.desktop /app/share/applications/io.github.bluemesh.BlueMesh.desktop
+      - install -Dm644 packaging/io.github.bluemesh.BlueMesh.metainfo.xml /app/share/metainfo/io.github.bluemesh.BlueMesh.metainfo.xml
+
+      # The existing icon source is data/bluemesh.svg; install it under the app
+      # id and keep a "bluemesh" alias because the GUI still uses the icon name
+      # "bluemesh".
+      - install -Dm644 data/bluemesh.svg /app/share/icons/hicolor/scalable/apps/io.github.bluemesh.BlueMesh.svg
+      - install -Dm644 data/bluemesh.svg /app/share/icons/hicolor/scalable/apps/bluemesh.svg
+
+      - install -Dm644 LICENSE /app/share/licenses/io.github.bluemesh.BlueMesh/LICENSE
+      - install -Dm644 backend/LICENSE /app/share/licenses/io.github.bluemesh.BlueMesh/LICENSE.bitmancer
+
+    sources:
+      # TODO(Flathub): replace this local directory with an immutable git source:
+      #
+      #   - type: git
+      #     url: https://github.com/YOUR-GITHUB-ACCOUNT/BlueMesh.git
+      #     tag: v0.1.0
+      #     commit: <full 40-character commit id>
+      #
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - backend/target
+          - .flatpak-builder
+          - build-dir
+          - repo
+          - shots
+          - __pycache__
+
+      - cargo-sources.json
