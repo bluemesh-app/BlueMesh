@@ -67,7 +67,20 @@
     <keyword>nostr</keyword>
   </keywords>
 
-  <!-- TODO: add screenshots before a Flathub submission. -->
+  <screenshots>
+    <screenshot type="default">
+      <caption>Contacts and nearby devices on the mesh</caption>
+      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/master/packaging/screenshots/contacts-mira-cole.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Encrypted chat over Bluetooth</caption>
+      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/master/packaging/screenshots/chat-mira.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Sending an encrypted picture</caption>
+      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/master/packaging/screenshots/file-cole.png</image>
+    </screenshot>
+  </screenshots>
   <content_rating type="oars-1.1"/>
 
   <releases>
