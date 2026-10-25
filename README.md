@@ -89,8 +89,20 @@ and a Rust toolchain to build the backend.
 
 ## Build and install
 
-    cd backend && cargo build --release --bin bluemeshd && cd ..
+Needs git, a Rust toolchain (cargo), Python 3 with PyGObject/GTK 4, and BlueZ.
+
+    git clone https://github.com/bluemesh-app/BlueMesh.git
+    cd BlueMesh
+    (cd backend && cargo build --release --bin bluemeshd)
     ./install.sh
+
+Run every command from the `BlueMesh` folder created by `git clone`, not from
+your home directory. To pin the release, run `git checkout v0.1.0` after `cd BlueMesh`.
+
+Flatpak: from the same `BlueMesh` folder, build with the manifest in `packaging/`
+(see `packaging/FLATPAK.md`), e.g.
+
+    flatpak-builder --user --install --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
 
 Then launch **BlueMesh** from the app grid, or run `bluemesh`.
 
