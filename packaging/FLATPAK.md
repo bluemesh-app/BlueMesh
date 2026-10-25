@@ -11,7 +11,7 @@ consistently everywhere and matches the GitHub account `bluemesh-app`
 | --- | --- |
 | `io.github.bluemesh_app.BlueMesh.yml` | Flatpak manifest: builds `bluemeshd` with cargo, installs the GUI, daemon, desktop file, metainfo and icon under `/app`. |
 | `cargo-sources.json` | Vendored Rust crate sources generated from `backend/Cargo.lock`. |
-| `io.github.bluemesh_app.BlueMesh.metainfo.xml` | AppStream metadata. Homepage/bugtracker point at https://github.com/bluemesh-app/BlueMesh; the tip URL is still a placeholder. |
+| `io.github.bluemesh_app.BlueMesh.metainfo.xml` | AppStream metadata. Homepage/bugtracker point at https://github.com/bluemesh-app/BlueMesh; the donation URL is https://buymeacoffee.com/bluemesh.app. |
 | `io.github.bluemesh_app.BlueMesh.desktop` | Desktop entry whose filename matches the app id. |
 | `io.github.bluemesh_app.BlueMesh.sh` | Installed to `/app/bin/io.github.bluemesh_app.BlueMesh`; launches the GTK GUI and points it at `/app/bin/bluemeshd`. |
 
@@ -29,8 +29,8 @@ PNGs as `bluemesh.png`.
    `bluemesh-app` (done).
 2. Homepage/bugtracker URLs in the metainfo file point at
    https://github.com/bluemesh-app/BlueMesh (done).
-3. Replace the `example.org` tip URL. **Do not commit a live Polar/Lemon
-   checkout URL until Dyl supplies one.**
+3. Donation URL in the metainfo file points at
+   https://buymeacoffee.com/bluemesh.app (done).
 4. Replace the local `dir` source with a pinned git source (URL + tag + commit).
 5. Add screenshots to the metainfo before submitting.
 

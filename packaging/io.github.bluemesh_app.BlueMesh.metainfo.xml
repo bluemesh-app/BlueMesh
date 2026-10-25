@@ -6,9 +6,7 @@
   bluemesh-app (https://github.com/bluemesh-app/BlueMesh); Flathub maps the
   hyphen to an underscore.
 
-  TODO: replace the placeholder donation URL below.
-  The donation URL is deliberately an example.org placeholder. Do not put a
-  live Polar/Lemon checkout URL here until Dyl supplies one.
+  Donation/tip link: Buy Me a Coffee (https://buymeacoffee.com/bluemesh.app).
 -->
 <component type="desktop-application">
   <id>io.github.bluemesh_app.BlueMesh</id>
@@ -41,12 +39,10 @@
 
   <launchable type="desktop-id">io.github.bluemesh_app.BlueMesh.desktop</launchable>
 
-  <!-- TODO: replace with the real project GitHub URLs. -->
   <url type="homepage">https://github.com/bluemesh-app/BlueMesh</url>
   <url type="bugtracker">https://github.com/bluemesh-app/BlueMesh/issues</url>
 
-  <!-- TODO(Dyl): replace this clear placeholder with the real tip URL. -->
-  <url type="donation">https://example.org/TODO-tip-url</url>
+  <url type="donation">https://buymeacoffee.com/bluemesh.app</url>
 
   <developer id="io.github.bluemesh_app">
     <name>BlueMesh contributors</name>

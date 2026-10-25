@@ -1,11 +1,10 @@
 # Flatpak manifest skeleton for BlueMesh. NOT submitted to Flathub.
 #
 # TODO(Dyl) before a real build/submission:
-#   1. Replace the example.org tip URL in the metainfo file. Do not use a
-#      live Polar/Lemon checkout yet.
-#   2. Replace the local "dir" source below with a pinned git source (URL,
+#   1. Replace the local "dir" source below with a pinned git source (URL,
 #      tag and commit) once the release tag exists.
 #
+# Done: donation URL in the metainfo is https://buymeacoffee.com/bluemesh.app.
 # Done: app id is io.github.bluemesh_app.BlueMesh (GitHub account
 # bluemesh-app) everywhere, including gui/bluemesh.py APP_ID and the desktop
 # StartupWMClass. The crate sources are generated in
