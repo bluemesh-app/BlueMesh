@@ -106,6 +106,12 @@ two are fetched automatically by `--install-deps-from=flathub`):
     flatpak-builder --user --install --install-deps-from=flathub --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
     flatpak run io.github.bluemesh_app.BlueMesh
 
+If Ubuntu's `flatpak-builder` is too old or fails, use the Flathub one
+(`org.flatpak.Builder`). It runs sandboxed, so point it at your user install:
+
+    flatpak install --user flathub org.flatpak.Builder
+    FLATPAK_USER_DIR=$HOME/.local/share/flatpak flatpak run --filesystem=home --env=FLATPAK_USER_DIR=$HOME/.local/share/flatpak org.flatpak.Builder --user --install --install-deps-from=flathub --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
+
 More detail: [`packaging/FLATPAK.md`](packaging/FLATPAK.md).
 
 ### 3. From source (optional)

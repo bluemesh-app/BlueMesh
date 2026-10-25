@@ -86,6 +86,16 @@ flatpak-builder --user --install-deps-from=flathub --force-clean build-dir packa
 flatpak run io.github.bluemesh_app.BlueMesh
 ```
 
+### Ubuntu: using org.flatpak.Builder
+
+If Ubuntu's `flatpak-builder` is too old or fails, use the Flathub one
+(`org.flatpak.Builder`). It runs sandboxed, so point it at your user install:
+
+```sh
+flatpak install --user flathub org.flatpak.Builder
+FLATPAK_USER_DIR=$HOME/.local/share/flatpak flatpak run --filesystem=home --env=FLATPAK_USER_DIR=$HOME/.local/share/flatpak org.flatpak.Builder --user --install --install-deps-from=flathub --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
+```
+
 Lint the way Flathub does:
 
 ```sh
