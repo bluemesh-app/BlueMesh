@@ -1,14 +1,12 @@
-# Flatpak manifest skeleton for BlueMesh. NOT submitted to Flathub.
+# Flatpak manifest for BlueMesh. Not yet submitted to Flathub.
 #
-# TODO(Dyl) before a real build/submission:
-#   1. Replace the local "dir" source below with a pinned git source (URL,
-#      tag and commit) once the release tag exists.
+# Builds from the pinned v0.1.0 git tag on GitHub. For a new release, bump
+# "tag" and "commit" below (commit = full id of the tagged commit), and
+# regenerate cargo-sources.json if backend/Cargo.lock changed.
 #
-# Done: donation URL in the metainfo is https://buymeacoffee.com/bluemesh.app.
-# Done: app id is io.github.bluemesh_app.BlueMesh (GitHub account
-# bluemesh-app) everywhere, including gui/bluemesh.py APP_ID and the desktop
-# StartupWMClass. The crate sources are generated in
-# packaging/cargo-sources.json and included below.
+# For a local build of uncommitted changes, temporarily swap the git source
+# for:  - type: dir
+#         path: ..
 #
 # Runtime note: org.gnome.Platform already provides Python 3, PyGObject,
 # GTK 4 and libadwaita; the GUI needs no vendored Python packages.
@@ -68,22 +66,8 @@ modules:
       - install -Dm644 backend/LICENSE /app/share/licenses/io.github.bluemesh_app.BlueMesh/LICENSE.bitmancer
 
     sources:
-      # TODO(Flathub): replace this local directory with an immutable git source:
-      #
-      #   - type: git
-      #     url: https://github.com/bluemesh-app/BlueMesh.git
-      #     tag: v0.1.0
-      #     commit: <full 40-character commit id>
-      #
-      - type: dir
-        path: ..
-        skip:
-          - .git
-          - backend/target
-          - .flatpak-builder
-          - build-dir
-          - repo
-          - shots
-          - __pycache__
+      - type: git
+        url: https://github.com/bluemesh-app/BlueMesh.git
+        tag: v0.1.0
 
       - cargo-sources.json

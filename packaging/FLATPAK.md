@@ -1,9 +1,12 @@
-# Flatpak / AppStream packaging (skeleton)
+# Flatpak / AppStream packaging
 
-This is a **skeleton only**. It has not been submitted to Flathub and no Flathub
-account was created. The app id `io.github.bluemesh_app.BlueMesh` is used
-consistently everywhere and matches the GitHub account `bluemesh-app`
+Not yet submitted to Flathub. The app id `io.github.bluemesh_app.BlueMesh` is
+used consistently everywhere and matches the GitHub account `bluemesh-app`
 (Flathub turns the hyphen into an underscore).
+
+The manifest builds from the pinned `v0.1.0` git tag
+(https://github.com/bluemesh-app/BlueMesh/releases/tag/v0.1.0), and the
+metainfo screenshot URLs point at that tag rather than `master`.
 
 ## Files
 
@@ -23,16 +26,21 @@ plus a `bluemesh.png` alias. If the app id changes, update those install lines
 and `Icon=` in the desktop file. The per-user `install.sh` installs the same
 PNGs as `bluemesh.png`.
 
-## Remaining TODOs before a real build / Flathub submission
+## Release checklist
 
-1. App id `io.github.bluemesh_app.BlueMesh` matches GitHub account
-   `bluemesh-app` (done).
-2. Homepage/bugtracker URLs in the metainfo file point at
-   https://github.com/bluemesh-app/BlueMesh (done).
-3. Donation URL in the metainfo file points at
-   https://buymeacoffee.com/bluemesh.app (done).
-4. Replace the local `dir` source with a pinned git source (URL + tag + commit).
-5. Add screenshots to the metainfo before submitting.
+- [x] App id `io.github.bluemesh_app.BlueMesh` matches GitHub account `bluemesh-app`.
+- [x] Homepage/bugtracker URLs point at https://github.com/bluemesh-app/BlueMesh.
+- [x] Donation URL points at https://buymeacoffee.com/bluemesh.app.
+- [x] Screenshots in the metainfo, pinned to the `v0.1.0` tag.
+- [x] `v0.1.0` tag and GitHub release.
+- [x] Manifest uses a pinned git source (URL + tag + commit) instead of a local `dir`.
+- [ ] Full local `flatpak-builder` build and run from the git source.
+- [ ] `flatpak-builder-lint` passes on the manifest and the built repo.
+- [ ] Open the Flathub submission PR (by hand, see `FLATHUB-SUBMISSION.md`).
+
+For each new release: tag it, add a `<release>` entry to the metainfo, point
+the screenshot URLs at the new tag, update `tag:` and `commit:` in the
+manifest, and regenerate `cargo-sources.json` if `backend/Cargo.lock` changed.
 
 ## Before you start
 
@@ -51,7 +59,7 @@ flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable
 # Parse/normalise the YAML manifest (no build, no source download).
 flatpak-builder --show-manifest packaging/io.github.bluemesh_app.BlueMesh.yml
 
-# Resolve/download sources only; does not run cargo or any build command.
+# Resolve/download sources only (clones the v0.1.0 tag); no build.
 flatpak-builder --download-only packaging/io.github.bluemesh_app.BlueMesh.yml
 ```
 
@@ -76,6 +84,15 @@ The manifest includes `cargo-sources.json` in the module `sources` and keeps
 ```sh
 flatpak-builder --user --install-deps-from=flathub --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
 flatpak run io.github.bluemesh_app.BlueMesh
+```
+
+Lint the way Flathub does:
+
+```sh
+flatpak install flathub org.flatpak.Builder
+flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest packaging/io.github.bluemesh_app.BlueMesh.yml
+flatpak-builder --repo=repo --force-clean build-dir packaging/io.github.bluemesh_app.BlueMesh.yml
+flatpak run --command=flatpak-builder-lint org.flatpak.Builder repo repo
 ```
 
 ## Metadata and non-Flatpak tests

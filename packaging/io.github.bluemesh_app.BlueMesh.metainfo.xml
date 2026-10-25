@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  AppStream metadata skeleton for BlueMesh.
+  AppStream metadata for BlueMesh.
 
   App id io.github.bluemesh_app.BlueMesh matches the GitHub account
   bluemesh-app (https://github.com/bluemesh-app/BlueMesh); Flathub maps the
@@ -66,23 +66,30 @@
   <screenshots>
     <screenshot type="default">
       <caption>Contacts and nearby devices on the mesh</caption>
-      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/master/packaging/screenshots/contacts-mira-cole.png</image>
+      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/v0.1.0/packaging/screenshots/contacts-mira-cole.png</image>
     </screenshot>
     <screenshot>
       <caption>Encrypted chat over Bluetooth</caption>
-      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/master/packaging/screenshots/chat-mira.png</image>
+      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/v0.1.0/packaging/screenshots/chat-mira.png</image>
     </screenshot>
     <screenshot>
       <caption>Sending an encrypted picture</caption>
-      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/master/packaging/screenshots/file-cole.png</image>
+      <image>https://raw.githubusercontent.com/bluemesh-app/BlueMesh/v0.1.0/packaging/screenshots/file-cole.png</image>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1"/>
 
   <releases>
     <release version="0.1.0" date="2026-10-25">
+      <url type="details">https://github.com/bluemesh-app/BlueMesh/releases/tag/v0.1.0</url>
       <description>
-        <p>Initial Flatpak and AppStream packaging skeleton.</p>
+        <p>First release.</p>
+        <ul>
+          <li>Public mesh chat and Noise-encrypted direct messages over Bluetooth LE</li>
+          <li>Private file transfer with image preview</li>
+          <li>Favourites, block list and emergency wipe</li>
+          <li>Optional geohash location channels over Nostr</li>
+        </ul>
       </description>
     </release>
   </releases>
